@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "py-market-maker"
+version = "0.1.0"
+description = "Simple Python market maker example for Kuest based prediction markets"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+  "python-dotenv>=1.2.1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest==8.4.2",
+]
+
+[project.scripts]
+py-market-maker = "py_market_maker.main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["py_market_maker*"]
