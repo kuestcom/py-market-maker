@@ -4,6 +4,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
+from enum import Enum
 from typing import Any, Callable
 
 from py_clob_client.client import ClobClient
@@ -55,6 +56,7 @@ class TokenQuote:
     token_id: str
     fair_price: Decimal
     plan: QuotePlan | None
+    skip_reason: str | None
 
 
 @dataclass(frozen=True)
@@ -62,6 +64,36 @@ class QuoteInputs:
     fair_price: Decimal
     best_bid: Decimal | None
     best_ask: Decimal | None
+
+
+class LiquidityRejectKind(str, Enum):
+    MISSING_TWO_SIDED_BOOK = "missing_two_sided_book"
+    INVALID_TICK = "invalid_tick"
+    SPREAD_TOO_WIDE = "spread_too_wide"
+    BID_DEPTH_TOO_LOW = "bid_depth_too_low"
+    ASK_DEPTH_TOO_LOW = "ask_depth_too_low"
+
+
+@dataclass(frozen=True)
+class LiquidityRejectReason:
+    kind: LiquidityRejectKind
+    spread_ticks: Decimal | None = None
+    max_spread_ticks: int | None = None
+    depth: Decimal | None = None
+    min_depth: Decimal | None = None
+
+    def message(self) -> str:
+        if self.kind == LiquidityRejectKind.MISSING_TWO_SIDED_BOOK:
+            return "missing a valid two-sided book"
+        if self.kind == LiquidityRejectKind.INVALID_TICK:
+            return "book tick size is invalid"
+        if self.kind == LiquidityRejectKind.SPREAD_TOO_WIDE:
+            return f"spread is {self.spread_ticks} ticks above max {self.max_spread_ticks}"
+        if self.kind == LiquidityRejectKind.BID_DEPTH_TOO_LOW:
+            return f"best bid depth {self.depth} below minimum {self.min_depth}"
+        if self.kind == LiquidityRejectKind.ASK_DEPTH_TOO_LOW:
+            return f"best ask depth {self.depth} below minimum {self.min_depth}"
+        return self.kind.value
 
 
 @dataclass
@@ -300,7 +332,8 @@ def quote_market(
         token_quote = build_token_quote(market, token, book, config)
         token_quotes.append(token_quote)
         if token_quote.plan is None:
-            print(f"skip {_market_slug(market)} {_token_outcome(token)}: no safe quote at configured edge/sides")
+            reason = token_quote.skip_reason or "no safe quote at configured edge/sides"
+            print(f"skip {_market_slug(market)} {_token_outcome(token)}: {reason}")
             continue
 
         print_plan(token_quote.plan, config.live)
@@ -321,10 +354,17 @@ def build_token_quote(
     config: Config,
 ) -> TokenQuote:
     quote_inputs = build_quote_inputs(token, book)
+    liquidity_skip = None
+    if should_enforce_liquidity_quality(config):
+        reject_reason = liquidity_quality_reject_reason(book, config)
+        if reject_reason is not None:
+            liquidity_skip = f"liquidity quality check failed: {reject_reason.message()}"
+    plan = None if liquidity_skip else build_quote_plan(market, token, book, quote_inputs, config)
     return TokenQuote(
         token_id=_token_id(token),
         fair_price=quote_inputs.fair_price,
-        plan=build_quote_plan(market, token, book, quote_inputs, config),
+        plan=plan,
+        skip_reason=liquidity_skip if plan is None else None,
     )
 
 
@@ -395,6 +435,76 @@ def order_size(market: dict[str, Any], config: Config) -> Decimal:
     if config.respect_reward_min_size:
         size = max(size, _decimal(_dict_field(market, "rewards").get("min_size"), Decimal("0")))
     return size
+
+
+def should_enforce_liquidity_quality(config: Config) -> bool:
+    return config.live and config.require_two_sided_live
+
+
+def liquidity_quality_reject_reason(
+    book: OrderBookSummary,
+    config: Config,
+) -> LiquidityRejectReason | None:
+    return liquidity_reject_reason(
+        book.bids or [],
+        book.asks or [],
+        _decimal(book.tick_size, Decimal("0")),
+        config.max_book_spread_ticks,
+        config.min_top_depth,
+    )
+
+
+def liquidity_reject_reason(
+    bids: list[OrderSummary],
+    asks: list[OrderSummary],
+    tick: Decimal,
+    max_spread_ticks: int,
+    min_top_depth: Decimal,
+) -> LiquidityRejectReason | None:
+    if tick <= Decimal("0"):
+        return LiquidityRejectReason(LiquidityRejectKind.INVALID_TICK)
+
+    bid = best_bid(bids)
+    ask = best_ask(asks)
+    if bid is None or ask is None or bid <= Decimal("0") or ask <= bid:
+        return LiquidityRejectReason(LiquidityRejectKind.MISSING_TWO_SIDED_BOOK)
+
+    spread_ticks = (ask - bid) / tick
+    if spread_ticks > Decimal(max_spread_ticks):
+        return LiquidityRejectReason(
+            LiquidityRejectKind.SPREAD_TOO_WIDE,
+            spread_ticks=spread_ticks,
+            max_spread_ticks=max_spread_ticks,
+        )
+
+    bid_depth = top_depth(bids, bid)
+    if bid_depth < min_top_depth:
+        return LiquidityRejectReason(
+            LiquidityRejectKind.BID_DEPTH_TOO_LOW,
+            depth=bid_depth,
+            min_depth=min_top_depth,
+        )
+
+    ask_depth = top_depth(asks, ask)
+    if ask_depth < min_top_depth:
+        return LiquidityRejectReason(
+            LiquidityRejectKind.ASK_DEPTH_TOO_LOW,
+            depth=ask_depth,
+            min_depth=min_top_depth,
+        )
+
+    return None
+
+
+def top_depth(levels: list[OrderSummary], price: Decimal) -> Decimal:
+    return sum(
+        (
+            _decimal(level.size, Decimal("0"))
+            for level in levels
+            if _decimal_or_none(level.price) == price
+        ),
+        Decimal("0"),
+    )
 
 
 def print_plan(plan: QuotePlan, live: bool) -> None:

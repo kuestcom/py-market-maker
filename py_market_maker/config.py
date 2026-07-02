@@ -44,11 +44,14 @@ class Config:
     edge_ticks: int
     min_spread_ticks: int
     max_loss_per_market: Decimal
+    max_book_spread_ticks: int
+    min_top_depth: Decimal
     quote_sides: QuoteSides
     allow_single_sided: bool
     respect_reward_min_size: bool
     cancel_before_quote: bool
     post_only: bool
+    require_two_sided_live: bool
     discover_only: bool
     cycles: int
     refresh_secs: int
@@ -74,11 +77,14 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
         edge_ticks=args.edge_ticks,
         min_spread_ticks=args.min_spread_ticks,
         max_loss_per_market=args.max_loss_per_market,
+        max_book_spread_ticks=args.max_book_spread_ticks,
+        min_top_depth=args.min_top_depth,
         quote_sides=QuoteSides(args.quote_sides),
         allow_single_sided=args.allow_single_sided,
         respect_reward_min_size=args.respect_reward_min_size,
         cancel_before_quote=args.cancel_before_quote,
         post_only=args.post_only,
+        require_two_sided_live=args.require_two_sided_live,
         discover_only=args.discover_only,
         cycles=args.cycles,
         refresh_secs=args.refresh_secs,
@@ -149,6 +155,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=_env_decimal("MARKET_MAKER_MAX_LOSS_PER_MARKET", Decimal("25")),
     )
     parser.add_argument(
+        "--max-book-spread-ticks",
+        type=int,
+        default=_env_int("MARKET_MAKER_MAX_BOOK_SPREAD_TICKS", 20),
+    )
+    parser.add_argument(
+        "--min-top-depth",
+        type=_parse_decimal,
+        default=_env_decimal("MARKET_MAKER_MIN_TOP_DEPTH", Decimal("5")),
+    )
+    parser.add_argument(
         "--quote-sides",
         choices=[side.value for side in QuoteSides],
         default=_env_choice(
@@ -176,6 +192,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--post-only",
         action=argparse.BooleanOptionalAction,
         default=_env_bool("MARKET_MAKER_POST_ONLY", True),
+    )
+    parser.add_argument(
+        "--require-two-sided-live",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("MARKET_MAKER_REQUIRE_TWO_SIDED_LIVE", True),
     )
     parser.add_argument(
         "--discover-only",
@@ -209,6 +230,10 @@ def validate_config(config: Config, parser: argparse.ArgumentParser) -> None:
         parser.error("MARKET_MAKER_MIN_SPREAD_TICKS must be greater than zero")
     if config.max_loss_per_market <= Decimal("0"):
         parser.error("MARKET_MAKER_MAX_LOSS_PER_MARKET must be greater than zero")
+    if config.max_book_spread_ticks <= 0:
+        parser.error("MARKET_MAKER_MAX_BOOK_SPREAD_TICKS must be greater than zero")
+    if config.min_top_depth < Decimal("0"):
+        parser.error("MARKET_MAKER_MIN_TOP_DEPTH cannot be negative")
     if config.event_slug is not None and not config.event_slug.strip():
         parser.error("MARKET_MAKER_EVENT_SLUG cannot be empty")
     if config.cycles <= 0:
@@ -282,6 +307,9 @@ def _env_choice(name: str, default: str, choices: list[str]) -> str:
 
 def _parse_decimal(value: str) -> Decimal:
     try:
-        return Decimal(str(value))
+        parsed = Decimal(str(value))
     except InvalidOperation as error:
         raise argparse.ArgumentTypeError(f"{value} is not a decimal") from error
+    if not parsed.is_finite():
+        raise argparse.ArgumentTypeError(f"{value} must be a finite decimal")
+    return parsed
