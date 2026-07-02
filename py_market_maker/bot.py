@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import signal
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -28,12 +29,25 @@ from .state import SeenMarkets
 
 INITIAL_CURSOR = "MA=="
 CONDITIONAL_TOKEN_BASE_UNITS = Decimal("1000000")
+CANCEL_ORDER_BATCH_SIZE = 50
+CANCEL_VERIFY_ATTEMPTS = 5
+CANCEL_VERIFY_DELAY_SECS = 2
 
 
 @dataclass(frozen=True)
 class MarketCandidate:
     market: dict[str, Any]
     is_new: bool
+
+
+@dataclass
+class CancelOpenOrdersSummary:
+    markets_checked: int = 0
+    tokens_checked: int = 0
+    orders_found: int = 0
+    canceled: int = 0
+    not_canceled: int = 0
+    remaining_open: int = 0
 
 
 @dataclass(frozen=True)
@@ -193,28 +207,63 @@ class LiveMarketState:
                 return
 
 
+class ShutdownRequested(Exception):
+    pass
+
+
 def run(config: Config) -> None:
     public_client = ClobClient(config.clob_host)
     live_client = authenticate(config) if config.live else None
+
+    if config.cancel_all:
+        cancel_scope_orders(public_client, require_live_client(live_client), config)
+        return
+
+    if config.cancel_all_on_exit:
+        run_with_cancel_on_exit(public_client, require_live_client(live_client), config)
+        return
+
+    run_cycles(public_client, live_client, config)
+
+
+def run_with_cancel_on_exit(public_client: ClobClient, live_client: ClobClient, config: Config) -> None:
+    managed_scope: list[dict[str, Any]] = []
+    previous_sigint = signal.getsignal(signal.SIGINT)
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def request_shutdown(signum: int, _frame: Any) -> None:
+        raise ShutdownRequested(f"received signal {signum}")
+
+    signal.signal(signal.SIGINT, request_shutdown)
+    signal.signal(signal.SIGTERM, request_shutdown)
+    try:
+        run_cycles(public_client, live_client, config, managed_scope)
+    except (KeyboardInterrupt, ShutdownRequested) as error:
+        print(f"shutdown requested: {error}; canceling scoped open orders")
+        cancel_scope_orders(public_client, live_client, config, managed_scope)
+    finally:
+        signal.signal(signal.SIGINT, previous_sigint)
+        signal.signal(signal.SIGTERM, previous_sigterm)
+
+
+def require_live_client(live_client: ClobClient | None) -> ClobClient:
+    if live_client is None:
+        raise RuntimeError("cancel-all requires a live authenticated client")
+    return live_client
+
+
+def run_cycles(
+    public_client: ClobClient,
+    live_client: ClobClient | None,
+    config: Config,
+    managed_scope: list[dict[str, Any]] | None = None,
+) -> None:
     seen = SeenMarkets.load(config.state_path)
 
     for cycle in range(1, config.cycles + 1):
-        event_slug = config.event_slug.strip() if config.event_slug else None
-        if event_slug:
-            print(f"cycle {cycle}/{config.cycles}: discovering markets for event {event_slug}")
-            markets = discover_event_markets(public_client, event_slug, config.max_pages)
-            candidates = select_event_candidates(markets, config.max_markets)
-        else:
-            print(f"cycle {cycle}/{config.cycles}: discovering markets")
-            markets = discover_markets(public_client, config.discovery, config.max_pages)
-            candidates = select_candidates(markets, seen, config.max_markets)
-            seen.save(config.state_path)
-
-        new_count = sum(1 for candidate in candidates if candidate.is_new)
-        if event_slug:
-            print(f"event {event_slug}: found {len(candidates)} tradable markets")
-        else:
-            print(f"found {len(candidates)} tradable fork-scoped markets ({new_count} new)")
+        candidates = discover_cycle_candidates(public_client, config, seen, cycle)
+        if managed_scope is not None:
+            replace_managed_scope(managed_scope, candidates)
 
         for candidate in candidates:
             marker = "new" if candidate.is_new else "seen"
@@ -228,6 +277,33 @@ def run(config: Config) -> None:
 
         if cycle < config.cycles:
             time.sleep(config.refresh_secs)
+
+
+def discover_cycle_candidates(
+    public_client: ClobClient,
+    config: Config,
+    seen: SeenMarkets,
+    cycle: int,
+) -> list[MarketCandidate]:
+    event_slug = config.event_slug.strip() if config.event_slug else None
+    if event_slug:
+        print(f"cycle {cycle}/{config.cycles}: discovering markets for event {event_slug}")
+        markets = discover_event_markets(public_client, event_slug, config.max_pages)
+        candidates = select_event_candidates(markets, config.max_markets)
+        print(f"event {event_slug}: found {len(candidates)} tradable markets")
+        return candidates
+
+    print(f"cycle {cycle}/{config.cycles}: discovering markets")
+    markets = discover_markets(public_client, config.discovery, config.max_pages)
+    candidates = select_candidates(markets, seen, config.max_markets)
+    seen.save(config.state_path)
+    new_count = sum(1 for candidate in candidates if candidate.is_new)
+    print(f"found {len(candidates)} tradable fork-scoped markets ({new_count} new)")
+    return candidates
+
+
+def replace_managed_scope(managed_scope: list[dict[str, Any]], candidates: list[MarketCandidate]) -> None:
+    managed_scope[:] = [candidate.market for candidate in candidates]
 
 
 def authenticate(config: Config) -> ClobClient:
@@ -730,6 +806,108 @@ def market_loss_exceeds_cap(
 def open_orders_for_token(client: ClobClient, token_id: str) -> list[Any]:
     orders = client.get_orders(OpenOrderParams(asset_id=token_id))
     return orders if isinstance(orders, list) else []
+
+
+def cancel_scope_orders(
+    public_client: ClobClient,
+    live_client: ClobClient,
+    config: Config,
+    managed_scope: list[dict[str, Any]] | None = None,
+) -> None:
+    markets = list(managed_scope) if managed_scope is not None else discover_cancel_markets(public_client, config)
+    if not markets:
+        print("cancel-all: no scoped markets found")
+        return
+
+    print(f"cancel-all: checking {len(markets)} scoped markets")
+    summary = cancel_open_orders_for_markets(live_client, markets)
+    print_cancel_summary(summary)
+    if summary.remaining_open > 0:
+        raise RuntimeError(f"cancel-all left {summary.remaining_open} scoped open orders after verification")
+
+
+def discover_cancel_markets(public_client: ClobClient, config: Config) -> list[dict[str, Any]]:
+    event_slug = config.event_slug.strip() if config.event_slug else None
+    if event_slug:
+        markets = discover_event_markets(public_client, event_slug, config.max_pages)
+        return [candidate.market for candidate in select_event_candidates(markets, config.max_markets)]
+
+    seen = SeenMarkets.load(config.state_path)
+    markets = discover_markets(public_client, config.discovery, config.max_pages)
+    return [candidate.market for candidate in select_candidates(markets, seen, config.max_markets)]
+
+
+def cancel_open_orders_for_markets(
+    client: ClobClient,
+    markets: list[dict[str, Any]],
+) -> CancelOpenOrdersSummary:
+    token_ids = managed_token_ids(markets)
+    summary = CancelOpenOrdersSummary(
+        markets_checked=len(markets),
+        tokens_checked=len(token_ids),
+    )
+
+    for token_id in token_ids:
+        open_orders = open_orders_for_token(client, token_id)
+        if not open_orders:
+            continue
+
+        print(f"cancel-all: token {token_id} has {len(open_orders)} open orders")
+        summary.orders_found += len(open_orders)
+        order_ids = [order_id for order in open_orders for order_id in [open_order_id(order)] if order_id]
+        for batch in batched(order_ids, CANCEL_ORDER_BATCH_SIZE):
+            response = client.cancel_orders(batch)
+            canceled = _response_list(response, "canceled")
+            not_canceled = _response_list(response, "not_canceled")
+            summary.canceled += len(canceled)
+            summary.not_canceled += len(not_canceled)
+            print(
+                f"cancel-all: token {token_id} requested={len(batch)} "
+                f"canceled={len(canceled)} not_canceled={len(not_canceled)}"
+            )
+
+    if summary.orders_found > 0:
+        for attempt in range(1, CANCEL_VERIFY_ATTEMPTS + 1):
+            summary.remaining_open = remaining_open_orders_for_tokens(client, token_ids)
+            if summary.remaining_open == 0:
+                break
+            if attempt < CANCEL_VERIFY_ATTEMPTS:
+                print(
+                    f"cancel-all: {summary.remaining_open} scoped open orders remain; "
+                    f"waiting {CANCEL_VERIFY_DELAY_SECS}s before verification retry"
+                )
+                time.sleep(CANCEL_VERIFY_DELAY_SECS)
+
+    return summary
+
+
+def managed_token_ids(markets: list[dict[str, Any]]) -> list[str]:
+    token_ids: list[str] = []
+    seen: set[str] = set()
+    for market in markets:
+        for token in _market_tokens(market):
+            token_id = _token_id(token)
+            if token_id and token_id not in seen:
+                seen.add(token_id)
+                token_ids.append(token_id)
+    return token_ids
+
+
+def remaining_open_orders_for_tokens(client: ClobClient, token_ids: list[str]) -> int:
+    return sum(len(open_orders_for_token(client, token_id)) for token_id in token_ids)
+
+
+def print_cancel_summary(summary: CancelOpenOrdersSummary) -> None:
+    print(
+        "cancel-all: summary "
+        f"markets={summary.markets_checked} tokens={summary.tokens_checked} "
+        f"orders_found={summary.orders_found} canceled={summary.canceled} "
+        f"not_canceled={summary.not_canceled} remaining_open={summary.remaining_open}"
+    )
+
+
+def batched(items: list[str], batch_size: int) -> list[list[str]]:
+    return [items[index : index + batch_size] for index in range(0, len(items), batch_size)]
 
 
 def conditional_balance(client: ClobClient, token_id: str) -> Decimal:

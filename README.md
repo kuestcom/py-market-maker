@@ -90,6 +90,23 @@ If a sell order returns `position balance 0 below required 5000000`, the wallet
 has zero balance for that outcome token and the order size is 5 shares
 (`5 * 10^6` base units).
 
+To cancel all open orders in the currently configured market scope and exit:
+
+```bash
+python -m py_market_maker --live --cancel-all
+```
+
+To cancel scoped open orders when the process is interrupted, for example by
+Ctrl-C or SIGTERM:
+
+```bash
+python -m py_market_maker --live --cancel-all-on-exit --cycles 1000
+```
+
+Both cancel modes are live-only. With `--event-slug`, they target only the
+selected event's markets. Without `--event-slug`, they target the normal
+discovery selection.
+
 ## CLI args / env vars
 
 ```md
@@ -188,6 +205,16 @@ has zero balance for that outcome token and the order size is 5 shares
 
   --cancel-before-quote / MARKET_MAKER_CANCEL_BEFORE_QUOTE
   Default: true.
+
+  --cancel-all / MARKET_MAKER_CANCEL_ALL
+  Default: false.
+  In live mode, cancel open orders in the currently configured market scope and
+  exit.
+
+  --cancel-all-on-exit / MARKET_MAKER_CANCEL_ALL_ON_EXIT
+  Default: false.
+  In live mode, cancel open orders in the latest managed market scope when the
+  process is interrupted.
 
   --post-only / MARKET_MAKER_POST_ONLY
   Default: true.
