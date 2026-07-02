@@ -43,6 +43,12 @@ class Config:
     order_size: Decimal
     edge_ticks: int
     min_spread_ticks: int
+    band_min_margin_ticks: int | None
+    band_avg_margin_ticks: int | None
+    band_max_margin_ticks: int | None
+    band_min_size: Decimal | None
+    band_avg_size: Decimal | None
+    band_max_size: Decimal | None
     max_loss_per_market: Decimal
     max_book_spread_ticks: int
     min_top_depth: Decimal
@@ -76,6 +82,12 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
         order_size=args.order_size,
         edge_ticks=args.edge_ticks,
         min_spread_ticks=args.min_spread_ticks,
+        band_min_margin_ticks=args.band_min_margin_ticks,
+        band_avg_margin_ticks=args.band_avg_margin_ticks,
+        band_max_margin_ticks=args.band_max_margin_ticks,
+        band_min_size=args.band_min_size,
+        band_avg_size=args.band_avg_size,
+        band_max_size=args.band_max_size,
         max_loss_per_market=args.max_loss_per_market,
         max_book_spread_ticks=args.max_book_spread_ticks,
         min_top_depth=args.min_top_depth,
@@ -148,6 +160,36 @@ def build_parser() -> argparse.ArgumentParser:
         "--min-spread-ticks",
         type=int,
         default=_env_int("MARKET_MAKER_MIN_SPREAD_TICKS", 2),
+    )
+    parser.add_argument(
+        "--band-min-margin-ticks",
+        type=int,
+        default=_env_optional_int("MARKET_MAKER_BAND_MIN_MARGIN_TICKS"),
+    )
+    parser.add_argument(
+        "--band-avg-margin-ticks",
+        type=int,
+        default=_env_optional_int("MARKET_MAKER_BAND_AVG_MARGIN_TICKS"),
+    )
+    parser.add_argument(
+        "--band-max-margin-ticks",
+        type=int,
+        default=_env_optional_int("MARKET_MAKER_BAND_MAX_MARGIN_TICKS"),
+    )
+    parser.add_argument(
+        "--band-min-size",
+        type=_parse_decimal,
+        default=_env_optional_decimal("MARKET_MAKER_BAND_MIN_SIZE"),
+    )
+    parser.add_argument(
+        "--band-avg-size",
+        type=_parse_decimal,
+        default=_env_optional_decimal("MARKET_MAKER_BAND_AVG_SIZE"),
+    )
+    parser.add_argument(
+        "--band-max-size",
+        type=_parse_decimal,
+        default=_env_optional_decimal("MARKET_MAKER_BAND_MAX_SIZE"),
     )
     parser.add_argument(
         "--max-loss-per-market",
@@ -228,6 +270,18 @@ def validate_config(config: Config, parser: argparse.ArgumentParser) -> None:
         parser.error("MARKET_MAKER_EDGE_TICKS must be greater than zero")
     if config.min_spread_ticks <= 0:
         parser.error("MARKET_MAKER_MIN_SPREAD_TICKS must be greater than zero")
+    band_min_margin, band_avg_margin, band_max_margin = band_margin_ticks(config)
+    if band_min_margin <= 0 or band_avg_margin <= 0 or band_max_margin <= 0:
+        parser.error("MARKET_MAKER_BAND_*_MARGIN_TICKS must be greater than zero")
+    if band_min_margin > band_avg_margin or band_avg_margin > band_max_margin:
+        parser.error("MARKET_MAKER_BAND_*_MARGIN_TICKS must satisfy min <= avg <= max")
+    if band_min_margin >= band_max_margin:
+        parser.error("MARKET_MAKER_BAND_MAX_MARGIN_TICKS must be greater than MARKET_MAKER_BAND_MIN_MARGIN_TICKS")
+    band_min_size, band_avg_size, band_max_size = band_sizes(config)
+    if band_min_size < Decimal("0") or band_avg_size <= Decimal("0") or band_max_size <= Decimal("0"):
+        parser.error("MARKET_MAKER_BAND_*_SIZE must be non-negative with avg and max greater than zero")
+    if band_min_size > band_avg_size or band_avg_size > band_max_size:
+        parser.error("MARKET_MAKER_BAND_*_SIZE must satisfy min <= avg <= max")
     if config.max_loss_per_market <= Decimal("0"):
         parser.error("MARKET_MAKER_MAX_LOSS_PER_MARKET must be greater than zero")
     if config.max_book_spread_ticks <= 0:
@@ -247,6 +301,24 @@ def validate_config(config: Config, parser: argparse.ArgumentParser) -> None:
             parser.error("--live requires KUEST_CHAIN_ID or --chain-id; use 137 for Polygon or 80002 for Amoy")
         if config.chain_id not in (POLYGON, AMOY):
             parser.error(f"unsupported chain id {config.chain_id}; SDK supports {POLYGON} and {AMOY}")
+
+
+def band_margin_ticks(config: Config) -> tuple[int, int, int]:
+    min_margin = config.band_min_margin_ticks if config.band_min_margin_ticks is not None else config.edge_ticks
+    avg_margin = config.band_avg_margin_ticks if config.band_avg_margin_ticks is not None else min_margin
+    max_margin = (
+        config.band_max_margin_ticks
+        if config.band_max_margin_ticks is not None
+        else min_margin + config.min_spread_ticks
+    )
+    return min_margin, avg_margin, max_margin
+
+
+def band_sizes(config: Config) -> tuple[Decimal, Decimal, Decimal]:
+    min_size = config.band_min_size if config.band_min_size is not None else config.order_size
+    avg_size = config.band_avg_size if config.band_avg_size is not None else max(config.order_size, min_size)
+    max_size = config.band_max_size if config.band_max_size is not None else max(avg_size, min_size)
+    return min_size, avg_size, max_size
 
 
 def _env_optional_str(name: str) -> str | None:
@@ -280,6 +352,13 @@ def _env_decimal(name: str, default: Decimal) -> Decimal:
     value = _env_optional_str(name)
     if value is None:
         return default
+    return _parse_decimal(value)
+
+
+def _env_optional_decimal(name: str) -> Decimal | None:
+    value = _env_optional_str(name)
+    if value is None:
+        return None
     return _parse_decimal(value)
 
 

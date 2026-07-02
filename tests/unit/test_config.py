@@ -49,3 +49,34 @@ def test_non_finite_top_depth_is_rejected(capsys):
 
     captured = capsys.readouterr()
     assert "NaN must be a finite decimal" in captured.err
+
+
+def test_invalid_band_margins_are_rejected(capsys):
+    with pytest.raises(SystemExit):
+        parse_args([
+            "--band-min-margin-ticks",
+            "4",
+            "--band-avg-margin-ticks",
+            "3",
+            "--band-max-margin-ticks",
+            "5",
+        ])
+
+    captured = capsys.readouterr()
+    assert "MARKET_MAKER_BAND_*_MARGIN_TICKS" in captured.err
+
+
+def test_zero_band_margin_is_rejected(capsys):
+    with pytest.raises(SystemExit):
+        parse_args(["--band-min-margin-ticks", "0"])
+
+    captured = capsys.readouterr()
+    assert "MARKET_MAKER_BAND_*_MARGIN_TICKS must be greater than zero" in captured.err
+
+
+def test_invalid_band_sizes_are_rejected(capsys):
+    with pytest.raises(SystemExit):
+        parse_args(["--band-min-size", "10", "--band-avg-size", "5", "--band-max-size", "10"])
+
+    captured = capsys.readouterr()
+    assert "MARKET_MAKER_BAND_*_SIZE" in captured.err

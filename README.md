@@ -14,8 +14,9 @@
 - Posts GTC limit orders only when `--live` is set. Dry-run is the default.
 
 The quoting strategy is intentionally simple: estimate fair value from the book
-midpoint, improve the visible top of book by one tick when possible, and keep a
-configurable edge away from fair value so it does not cross just to trade.
+midpoint, then maintain configured quote-size bands around that fair value. The
+bot cancels orders outside the active band, trims excess size above the band
+maximum, and only tops up when open size falls below the band minimum.
 
 ## Setup
 
@@ -129,6 +130,32 @@ has zero balance for that outcome token and the order size is 5 shares
 
   --min-spread-ticks / MARKET_MAKER_MIN_SPREAD_TICKS
   Default: 2.
+
+  --band-min-margin-ticks / MARKET_MAKER_BAND_MIN_MARGIN_TICKS
+  Optional. Default: --edge-ticks.
+  Inner band edge, in ticks away from fair. Existing orders closer than this
+  are canceled because they no longer have enough edge.
+
+  --band-avg-margin-ticks / MARKET_MAKER_BAND_AVG_MARGIN_TICKS
+  Optional. Default: band min margin.
+  Price level used for new top-up orders inside the band.
+
+  --band-max-margin-ticks / MARKET_MAKER_BAND_MAX_MARGIN_TICKS
+  Optional. Default: band min margin plus --min-spread-ticks.
+  Outer band edge, in ticks away from fair. Existing orders beyond this are
+  canceled because they are no longer part of the intended quote band.
+
+  --band-min-size / MARKET_MAKER_BAND_MIN_SIZE
+  Optional. Default: --order-size.
+  Minimum total open size allowed inside the active side band before topping up.
+
+  --band-avg-size / MARKET_MAKER_BAND_AVG_SIZE
+  Optional. Default: max(--order-size, band min size).
+  Target total open size after a top-up or excess cancellation pass.
+
+  --band-max-size / MARKET_MAKER_BAND_MAX_SIZE
+  Optional. Default: max(band avg size, band min size).
+  Maximum total open size allowed inside the active side band before trimming.
 
   --max-loss-per-market / MARKET_MAKER_MAX_LOSS_PER_MARKET
   Default: 25.
