@@ -56,6 +56,8 @@ class Config:
     allow_single_sided: bool
     respect_reward_min_size: bool
     cancel_before_quote: bool
+    cancel_all: bool
+    cancel_all_on_exit: bool
     post_only: bool
     require_two_sided_live: bool
     discover_only: bool
@@ -95,6 +97,8 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
         allow_single_sided=args.allow_single_sided,
         respect_reward_min_size=args.respect_reward_min_size,
         cancel_before_quote=args.cancel_before_quote,
+        cancel_all=args.cancel_all,
+        cancel_all_on_exit=args.cancel_all_on_exit,
         post_only=args.post_only,
         require_two_sided_live=args.require_two_sided_live,
         discover_only=args.discover_only,
@@ -231,6 +235,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=_env_bool("MARKET_MAKER_CANCEL_BEFORE_QUOTE", True),
     )
     parser.add_argument(
+        "--cancel-all",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("MARKET_MAKER_CANCEL_ALL", False),
+    )
+    parser.add_argument(
+        "--cancel-all-on-exit",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("MARKET_MAKER_CANCEL_ALL_ON_EXIT", False),
+    )
+    parser.add_argument(
         "--post-only",
         action=argparse.BooleanOptionalAction,
         default=_env_bool("MARKET_MAKER_POST_ONLY", True),
@@ -292,6 +306,10 @@ def validate_config(config: Config, parser: argparse.ArgumentParser) -> None:
         parser.error("MARKET_MAKER_EVENT_SLUG cannot be empty")
     if config.cycles <= 0:
         parser.error("MARKET_MAKER_CYCLES must be greater than zero")
+    if config.cancel_all and config.cancel_all_on_exit:
+        parser.error("MARKET_MAKER_CANCEL_ALL and MARKET_MAKER_CANCEL_ALL_ON_EXIT are mutually exclusive")
+    if (config.cancel_all or config.cancel_all_on_exit) and not config.live:
+        parser.error("MARKET_MAKER_CANCEL_ALL and MARKET_MAKER_CANCEL_ALL_ON_EXIT require --live")
     if config.live:
         if not config.private_key:
             parser.error("--live requires KUEST_PRIVATE_KEY or --private-key")

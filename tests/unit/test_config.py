@@ -80,3 +80,39 @@ def test_invalid_band_sizes_are_rejected(capsys):
 
     captured = capsys.readouterr()
     assert "MARKET_MAKER_BAND_*_SIZE" in captured.err
+
+
+def test_cancel_all_requires_live(capsys):
+    with pytest.raises(SystemExit):
+        parse_args(["--cancel-all"])
+
+    captured = capsys.readouterr()
+    assert "MARKET_MAKER_CANCEL_ALL and MARKET_MAKER_CANCEL_ALL_ON_EXIT require --live" in captured.err
+
+
+def test_cancel_all_on_exit_requires_live(capsys):
+    with pytest.raises(SystemExit):
+        parse_args(["--cancel-all-on-exit"])
+
+    captured = capsys.readouterr()
+    assert "MARKET_MAKER_CANCEL_ALL and MARKET_MAKER_CANCEL_ALL_ON_EXIT require --live" in captured.err
+
+
+def test_cancel_modes_are_mutually_exclusive(capsys):
+    with pytest.raises(SystemExit):
+        parse_args([*_live_args(), "--cancel-all", "--cancel-all-on-exit"])
+
+    captured = capsys.readouterr()
+    assert "MARKET_MAKER_CANCEL_ALL and MARKET_MAKER_CANCEL_ALL_ON_EXIT are mutually exclusive" in captured.err
+
+
+def _live_args():
+    return [
+        "--live",
+        "--private-key",
+        "0xabc",
+        "--deposit-wallet",
+        "0xdef",
+        "--chain-id",
+        "137",
+    ]
