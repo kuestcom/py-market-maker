@@ -60,6 +60,7 @@ class Config:
     cancel_all_on_exit: bool
     post_only: bool
     require_two_sided_live: bool
+    max_data_age_secs: int
     discover_only: bool
     cycles: int
     refresh_secs: int
@@ -101,6 +102,7 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
         cancel_all_on_exit=args.cancel_all_on_exit,
         post_only=args.post_only,
         require_two_sided_live=args.require_two_sided_live,
+        max_data_age_secs=args.max_data_age_secs,
         discover_only=args.discover_only,
         cycles=args.cycles,
         refresh_secs=args.refresh_secs,
@@ -255,6 +257,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=_env_bool("MARKET_MAKER_REQUIRE_TWO_SIDED_LIVE", True),
     )
     parser.add_argument(
+        "--max-data-age-secs",
+        type=int,
+        default=_env_int("MARKET_MAKER_MAX_DATA_AGE_SECS", 10),
+    )
+    parser.add_argument(
         "--discover-only",
         action=argparse.BooleanOptionalAction,
         default=_env_bool("MARKET_MAKER_DISCOVER_ONLY", False),
@@ -310,6 +317,8 @@ def validate_config(config: Config, parser: argparse.ArgumentParser) -> None:
         parser.error("MARKET_MAKER_CANCEL_ALL and MARKET_MAKER_CANCEL_ALL_ON_EXIT are mutually exclusive")
     if (config.cancel_all or config.cancel_all_on_exit) and not config.live:
         parser.error("MARKET_MAKER_CANCEL_ALL and MARKET_MAKER_CANCEL_ALL_ON_EXIT require --live")
+    if config.max_data_age_secs <= 0:
+        parser.error("MARKET_MAKER_MAX_DATA_AGE_SECS must be greater than zero")
     if config.live:
         if not config.private_key:
             parser.error("--live requires KUEST_PRIVATE_KEY or --private-key")

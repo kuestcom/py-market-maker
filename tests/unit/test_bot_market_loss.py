@@ -37,6 +37,7 @@ def test_live_market_state_removes_canceled_open_orders_from_exposure():
                 token_id="yes",
                 fair_price=Decimal("0.50"),
                 balance=Decimal("0"),
+                balance_fetched_at=100.0,
                 open_orders=[
                     {
                         "id": "stale",
@@ -47,8 +48,9 @@ def test_live_market_state_removes_canceled_open_orders_from_exposure():
                         "size_matched": "0",
                     }
                 ],
+                open_orders_fetched_at=100.0,
             ),
-            LiveTokenState("no", Decimal("0.50"), Decimal("0"), []),
+            LiveTokenState("no", Decimal("0.50"), Decimal("0"), 100.0, [], 100.0),
         ],
         pending_orders=[],
     )

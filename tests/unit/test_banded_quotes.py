@@ -99,6 +99,7 @@ def _plan(buy_band, sell_band=None):
         fair_price=Decimal("0.50"),
         best_bid=Decimal("0.49"),
         best_ask=Decimal("0.51"),
+        book_fetched_at=100.0,
         buy_band=buy_band,
         sell_band=sell_band,
     )
