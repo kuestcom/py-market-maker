@@ -83,7 +83,8 @@ open orders are older than the configured data-age limit. Buy-side sizing is
 inventory-aware: token balances, live open buys, and pending buys are counted
 before adding more long exposure to an outcome or market. When current state
 already breaches inventory or market-loss caps, the bot skips new quotes and
-can optionally cancel resting buy orders.
+can optionally cancel resting buy orders. It can also write a pause file so
+later cycles or restarts stop before discovery.
 
 By default live mode only posts buy orders.
 
@@ -245,6 +246,22 @@ emergency cancel target.
   Live-only circuit-breaker action. When current state already breaches
   inventory or market-loss caps, skip new quotes and cancel resting buy orders
   for the breached token.
+
+  --pause-on-risk-breach / MARKET_MAKER_PAUSE_ON_RISK_BREACH
+  Default: false.
+  Live-only circuit-breaker action. When current state already breaches a risk
+  cap, write the pause file and stop quoting further markets. Necessary when a
+  breached run should stay stopped across later cycles or process restarts.
+
+  --clear-pause / MARKET_MAKER_CLEAR_PAUSE
+  Default: false.
+  One-shot command. Removes the pause file and exits without connecting to the
+  CLOB API. Necessary after a manual risk review decides the bot may resume.
+
+  --pause-path / MARKET_MAKER_PAUSE_PATH
+  Default: state/paused.json.
+  Path to the persisted pause file checked before each cycle and after live
+  quote attempts.
 
   --post-only / MARKET_MAKER_POST_ONLY
   Default: true.

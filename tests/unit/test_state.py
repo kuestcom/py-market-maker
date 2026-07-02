@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from py_market_maker.state import SeenMarkets
+from py_market_maker.state import PauseState, SeenMarkets
 
 
 def test_missing_state_file_loads_empty(tmp_path):
@@ -30,3 +30,16 @@ def test_seen_markets_rejects_invalid_shape(tmp_path):
 
     with pytest.raises(RuntimeError, match="markets must be a list of strings"):
         SeenMarkets.load(path)
+
+
+def test_pause_state_round_trips_and_clears(tmp_path):
+    path = tmp_path / "state" / "paused.json"
+
+    saved = PauseState.save_reason(path, "risk breach test")
+    loaded = PauseState.load(path)
+
+    assert loaded == saved
+    assert loaded.reason == "risk breach test"
+    assert PauseState.clear(path) is True
+    assert PauseState.clear(path) is False
+    assert PauseState.load(path) is None

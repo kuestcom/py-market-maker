@@ -61,6 +61,9 @@ class Config:
     cancel_all: bool
     cancel_all_on_exit: bool
     cancel_on_risk_breach: bool
+    pause_on_risk_breach: bool
+    clear_pause: bool
+    pause_path: Path
     post_only: bool
     require_two_sided_live: bool
     max_data_age_secs: int
@@ -106,6 +109,9 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
         cancel_all=args.cancel_all,
         cancel_all_on_exit=args.cancel_all_on_exit,
         cancel_on_risk_breach=args.cancel_on_risk_breach,
+        pause_on_risk_breach=args.pause_on_risk_breach,
+        clear_pause=args.clear_pause,
+        pause_path=args.pause_path,
         post_only=args.post_only,
         require_two_sided_live=args.require_two_sided_live,
         max_data_age_secs=args.max_data_age_secs,
@@ -268,6 +274,21 @@ def build_parser() -> argparse.ArgumentParser:
         default=_env_bool("MARKET_MAKER_CANCEL_ON_RISK_BREACH", False),
     )
     parser.add_argument(
+        "--pause-on-risk-breach",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("MARKET_MAKER_PAUSE_ON_RISK_BREACH", False),
+    )
+    parser.add_argument(
+        "--clear-pause",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("MARKET_MAKER_CLEAR_PAUSE", False),
+    )
+    parser.add_argument(
+        "--pause-path",
+        type=_parse_path,
+        default=_parse_path(_env_str("MARKET_MAKER_PAUSE_PATH", "state/paused.json")),
+    )
+    parser.add_argument(
         "--post-only",
         action=argparse.BooleanOptionalAction,
         default=_env_bool("MARKET_MAKER_POST_ONLY", True),
@@ -302,6 +323,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def validate_config(config: Config, parser: argparse.ArgumentParser) -> None:
+    if config.clear_pause and (config.cancel_all or config.cancel_all_on_exit):
+        parser.error("MARKET_MAKER_CLEAR_PAUSE cannot be combined with cancel-all actions")
+    if config.clear_pause:
+        return
     if config.max_markets <= 0:
         parser.error("MARKET_MAKER_MAX_MARKETS must be greater than zero")
     if config.max_pages <= 0:
@@ -344,6 +369,8 @@ def validate_config(config: Config, parser: argparse.ArgumentParser) -> None:
         parser.error("MARKET_MAKER_CANCEL_ALL and MARKET_MAKER_CANCEL_ALL_ON_EXIT require --live")
     if config.cancel_on_risk_breach and not config.live:
         parser.error("MARKET_MAKER_CANCEL_ON_RISK_BREACH requires --live")
+    if config.pause_on_risk_breach and not config.live:
+        parser.error("MARKET_MAKER_PAUSE_ON_RISK_BREACH requires --live")
     if config.max_data_age_secs <= 0:
         parser.error("MARKET_MAKER_MAX_DATA_AGE_SECS must be greater than zero")
     if config.live:
@@ -446,3 +473,9 @@ def _parse_decimal(value: str) -> Decimal:
     if not parsed.is_finite():
         raise argparse.ArgumentTypeError(f"{value} must be a finite decimal")
     return parsed
+
+
+def _parse_path(value: str) -> Path:
+    if value == "":
+        raise argparse.ArgumentTypeError("path cannot be empty")
+    return Path(value)

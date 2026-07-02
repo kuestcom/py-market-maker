@@ -11,6 +11,8 @@ from py_market_maker.bot import (
     managed_token_ids,
     replace_managed_scope,
 )
+from py_market_maker.config import parse_args
+from py_market_maker.state import PauseState
 
 
 def test_managed_token_ids_are_deduped_in_scope_order():
@@ -78,6 +80,43 @@ def test_cancel_on_exit_preserves_signal_exit_code(monkeypatch):
 
     assert error.value.code == 128 + signal.SIGTERM
     assert canceled_scopes == [[_market("market", ["yes"])]]
+
+
+def test_run_clear_pause_exits_before_creating_client(monkeypatch, tmp_path):
+    path = tmp_path / "paused.json"
+    PauseState.save_reason(path, "risk breach test")
+    created_clients = []
+
+    def fake_clob_client(*_args, **_kwargs):
+        created_clients.append(True)
+        raise AssertionError("clear pause should not create a client")
+
+    monkeypatch.setattr(bot, "ClobClient", fake_clob_client)
+
+    bot.run(parse_args(["--clear-pause", "--pause-path", str(path)]))
+
+    assert PauseState.load(path) is None
+    assert created_clients == []
+
+
+def test_run_cycles_stops_before_discovery_when_paused(monkeypatch, tmp_path):
+    path = tmp_path / "paused.json"
+    PauseState.save_reason(path, "risk breach test")
+    discovered = []
+
+    def fake_discover_cycle_candidates(*_args, **_kwargs):
+        discovered.append(True)
+        return []
+
+    monkeypatch.setattr(bot, "discover_cycle_candidates", fake_discover_cycle_candidates)
+
+    bot.run_cycles(
+        object(),
+        None,
+        parse_args(["--pause-path", str(path)]),
+    )
+
+    assert discovered == []
 
 
 class FakeClient:

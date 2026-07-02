@@ -13,6 +13,7 @@ from py_market_maker.bot import (
 )
 from py_market_maker.config import parse_args
 from py_market_maker.market_loss import BUY, SELL, ProposedOrder
+from py_market_maker.state import PauseState
 
 
 def test_cancel_refreshes_open_orders_before_posting_replacement():
@@ -339,6 +340,75 @@ def test_cancel_on_risk_breach_does_not_cancel_unrelated_token_buys():
     assert client.created_orders == []
     assert client.posted_orders == []
     assert market_state.open_orders("yes") == [open_buy]
+
+
+def test_pause_on_risk_breach_writes_pause_file_and_skips_new_quotes(tmp_path):
+    pause_path = tmp_path / "paused.json"
+    market_state = _market_state(balance=Decimal("11"))
+    client = FakeClient(post_responses=[_post_response(True, "posted")])
+
+    post_quote_plan(
+        client,
+        _plan(buy_band=_buy_band()),
+        parse_args([
+            "--live",
+            "--private-key",
+            "0xabc",
+            "--deposit-wallet",
+            "0xdef",
+            "--chain-id",
+            "137",
+            "--pause-on-risk-breach",
+            "--pause-path",
+            str(pause_path),
+            "--max-inventory-per-token",
+            "10",
+        ]),
+        market_state,
+    )
+
+    pause = PauseState.load(pause_path)
+    assert pause is not None
+    assert pause.reason == "risk breach market Yes: token yes inventory 11 exceeds limit 10"
+    assert client.created_orders == []
+    assert client.posted_orders == []
+
+
+def test_active_pause_skips_stale_order_cancel(tmp_path):
+    pause_path = tmp_path / "paused.json"
+    PauseState.save_reason(pause_path, "manual stop")
+    stale_order = _open_order("stale", BUY, "0.46", "5")
+    market_state = _market_state(open_orders=[stale_order])
+    client = FakeClient(open_order_pages={"yes": [[]]})
+
+    post_quote_plan(
+        client,
+        _plan(buy_band=_buy_band()),
+        parse_args(["--pause-path", str(pause_path)]),
+        market_state,
+    )
+
+    assert client.cancel_batches == []
+    assert client.get_order_tokens == []
+    assert market_state.open_orders("yes") == [stale_order]
+
+
+def test_active_pause_skips_posting_orders(tmp_path):
+    pause_path = tmp_path / "paused.json"
+    PauseState.save_reason(pause_path, "manual stop")
+    market_state = _market_state()
+    client = FakeClient(post_responses=[_post_response(True, "posted")])
+
+    post_quote_plan(
+        client,
+        _plan(buy_band=_buy_band()),
+        parse_args(["--pause-path", str(pause_path)]),
+        market_state,
+    )
+
+    assert len(client.created_orders) == 1
+    assert client.posted_orders == []
+    assert market_state.pending_orders == []
 
 
 class FakeClient:

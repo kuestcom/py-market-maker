@@ -25,7 +25,7 @@ from .config import Config, DiscoveryMode, band_margin_ticks, band_sizes
 from .event_scope import condition_id_from_market, condition_ids_from_site_config
 from .market_loss import MarketExposure, OutcomeExposure, ProposedOrder
 from .pricing import ceil_to_tick, fair_price, floor_to_tick, is_tradeable_price
-from .state import SeenMarkets
+from .state import PauseState, SeenMarkets
 
 INITIAL_CURSOR = "MA=="
 CONDITIONAL_TOKEN_BASE_UNITS = Decimal("1000000")
@@ -365,6 +365,14 @@ class ShutdownRequested(Exception):
 
 
 def run(config: Config) -> None:
+    if config.clear_pause:
+        cleared = PauseState.clear(config.pause_path)
+        if cleared:
+            print(f"cleared pause file {config.pause_path}")
+        else:
+            print(f"no pause file at {config.pause_path}")
+        return
+
     public_client = ClobClient(config.clob_host)
     live_client = authenticate(config) if config.live else None
 
@@ -419,6 +427,9 @@ def run_cycles(
     seen = SeenMarkets.load(config.state_path)
 
     for cycle in range(1, config.cycles + 1):
+        if stop_if_paused(config):
+            return
+
         candidates = discover_cycle_candidates(public_client, config, seen, cycle)
         if managed_scope is not None:
             replace_managed_scope(managed_scope, candidates)
@@ -432,9 +443,19 @@ def run_cycles(
 
         for candidate in candidates:
             quote_market(public_client, live_client, candidate.market, config)
+            if stop_if_paused(config):
+                return
 
         if cycle < config.cycles:
             time.sleep(config.refresh_secs)
+
+
+def stop_if_paused(config: Config) -> bool:
+    pause = PauseState.load(config.pause_path)
+    if pause is None:
+        return False
+    print(f"paused by {config.pause_path}: {pause.reason.strip()}")
+    return True
 
 
 def discover_cycle_candidates(
@@ -615,8 +636,12 @@ def quote_market(
 
     market_state = LiveMarketState.load(live_client, token_quotes)
     for token_quote in token_quotes:
+        if stop_if_paused(config):
+            return
         if token_quote.plan is not None:
             post_quote_plan(live_client, token_quote.plan, config, market_state)
+            if stop_if_paused(config):
+                return
 
 
 def build_token_quote(
@@ -854,6 +879,8 @@ def post_quote_plan(
     if config.cancel_before_quote:
         orders_to_cancel = cancellable_orders(open_orders, plan)
         order_ids = [open_order_id(order) for order in orders_to_cancel if open_order_id(order)]
+        if order_ids and skip_live_action_if_paused(plan, config, "canceling stale orders"):
+            return
         response = client.cancel_orders(order_ids) if order_ids else {}
         canceled = _response_list(response, "canceled")
         not_canceled = _response_list(response, "not_canceled")
@@ -882,9 +909,13 @@ def post_quote_plan(
     if breaches:
         print_risk_breaches(plan, breaches)
         if config.cancel_on_risk_breach and risk_breach_applies_to_token(breaches, plan.token_id):
-            refreshed_orders = cancel_risk_increasing_orders(client, plan, open_orders)
+            refreshed_orders = cancel_risk_increasing_orders(client, plan, config, open_orders)
             if refreshed_orders is not None:
                 market_state.replace_open_orders(plan.token_id, refreshed_orders)
+        if config.pause_on_risk_breach:
+            reason = risk_breach_pause_reason(plan, breaches)
+            PauseState.save_reason(config.pause_path, reason)
+            print(f"wrote pause file {config.pause_path}: {reason}")
         return
 
     planned_orders: list[SubmittedOrder] = []
@@ -931,6 +962,9 @@ def post_quote_plan(
             )
         )
         planned_orders.append(SubmittedOrder(side=band.side, proposed_order=proposed, order=order))
+
+    if planned_orders and skip_live_action_if_paused(plan, config, "posting orders"):
+        return
 
     responses = [
         (planned_order, client.post_order(planned_order.order, orderType=OrderType.GTC, post_only=config.post_only))
@@ -1047,6 +1081,11 @@ def print_risk_breaches(plan: QuotePlan, breaches: list[RiskBreach]) -> None:
         print(f"risk breach {plan.market_slug} {plan.outcome}: {breach.message()}")
 
 
+def risk_breach_pause_reason(plan: QuotePlan, breaches: list[RiskBreach]) -> str:
+    messages = "; ".join(breach.message() for breach in breaches)
+    return f"risk breach {plan.market_slug} {plan.outcome}: {messages}"
+
+
 def risk_breach_applies_to_token(breaches: list[RiskBreach], token_id: str) -> bool:
     return any(
         breach.kind != "token_inventory" or breach.token_id == token_id
@@ -1057,6 +1096,7 @@ def risk_breach_applies_to_token(breaches: list[RiskBreach], token_id: str) -> b
 def cancel_risk_increasing_orders(
     client: ClobClient,
     plan: QuotePlan,
+    config: Config,
     open_orders: list[Any],
 ) -> list[Any] | None:
     order_ids = [
@@ -1069,6 +1109,9 @@ def cancel_risk_increasing_orders(
     if not order_ids:
         return None
 
+    if skip_live_action_if_paused(plan, config, "canceling risk-increasing orders"):
+        return None
+
     response = client.cancel_orders(order_ids)
     canceled = _response_list(response, "canceled")
     not_canceled = _response_list(response, "not_canceled")
@@ -1077,6 +1120,17 @@ def cancel_risk_increasing_orders(
         f"canceled={len(canceled)} not_canceled={len(not_canceled)}"
     )
     return open_orders_for_token(client, plan.token_id)
+
+
+def skip_live_action_if_paused(plan: QuotePlan, config: Config, action: str) -> bool:
+    pause = PauseState.load(config.pause_path)
+    if pause is None:
+        return False
+    print(
+        f"skip {action} for {plan.market_slug} {plan.outcome}: "
+        f"pause active at {config.pause_path} ({pause.reason.strip()})"
+    )
+    return True
 
 
 def market_loss_exceeds_cap(
