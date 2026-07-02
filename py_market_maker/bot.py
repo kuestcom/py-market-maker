@@ -18,6 +18,7 @@ from py_clob_client.clob_types import (
     OrderBookSummary,
     OrderSummary,
     OrderType,
+    TradeParams,
 )
 from py_clob_client.constants import END_CURSOR
 from py_clob_client.order_builder.constants import BUY, SELL
@@ -26,7 +27,7 @@ from .config import Config, DiscoveryMode, band_margin_ticks, band_sizes
 from .event_scope import condition_id_from_market, condition_ids_from_site_config
 from .market_loss import MarketExposure, OutcomeExposure, ProposedOrder
 from .pricing import ceil_to_tick, fair_price, floor_to_tick, is_tradeable_price
-from .state import PauseState, SeenMarkets
+from .state import FillLedger, FillRecord, PauseState, SeenMarkets
 
 INITIAL_CURSOR = "MA=="
 CONDITIONAL_TOKEN_BASE_UNITS = Decimal("1000000")
@@ -202,6 +203,7 @@ class LiveTokenState:
     balance_fetched_at: float
     open_orders: list[Any]
     open_orders_fetched_at: float
+    cost_basis: Decimal | None = None
 
 
 @dataclass
@@ -210,11 +212,30 @@ class LiveMarketState:
     pending_orders: list[ProposedOrder]
 
     @classmethod
-    def load(cls, client: ClobClient, token_quotes: list[TokenQuote]) -> "LiveMarketState":
+    def load(
+        cls,
+        client: ClobClient,
+        token_quotes: list[TokenQuote],
+        config: Config | None = None,
+    ) -> "LiveMarketState":
+        fill_ledger = FillLedger.load(config.fill_state_path) if config is not None else FillLedger()
+        fill_ledger_changed = False
         tokens = []
         for token_quote in token_quotes:
+            if config is not None:
+                token_id = token_quote.token_id
+                after_unix_secs = fill_ledger.latest_matched_at_unix_secs(token_id)
+                if after_unix_secs is not None:
+                    after_unix_secs = max(after_unix_secs - 1, 0)
+                for trade in trades_for_token(client, token_id, after_unix_secs):
+                    record = fill_record_from_trade(trade)
+                    if fill_ledger.upsert(record):
+                        fill_ledger_changed = True
+
             balance = conditional_balance(client, token_quote.token_id)
             balance_fetched_at = time.monotonic()
+            fill_records = fill_ledger.records_for_token(token_quote.token_id)
+            cost_basis = token_cost_basis(fill_records, balance, token_quote.fair_price)
             open_orders = open_orders_for_token(client, token_quote.token_id)
             open_orders_fetched_at = time.monotonic()
             tokens.append(
@@ -225,8 +246,14 @@ class LiveMarketState:
                     balance_fetched_at=balance_fetched_at,
                     open_orders=open_orders,
                     open_orders_fetched_at=open_orders_fetched_at,
+                    cost_basis=cost_basis,
                 )
             )
+        if config is not None:
+            if fill_ledger.prune_to_max_records(config.fill_max_records):
+                fill_ledger_changed = True
+            if fill_ledger_changed:
+                fill_ledger.save(config.fill_state_path)
         return cls(tokens=tokens, pending_orders=[])
 
     def exposure(self) -> MarketExposure:
@@ -235,7 +262,7 @@ class LiveMarketState:
                 OutcomeExposure(
                     token_id=token.token_id,
                     position=token.balance,
-                    cost=token.balance * token.fair_price,
+                    cost=token.cost_basis if token.cost_basis is not None else token.balance * token.fair_price,
                 )
                 for token in self.tokens
             ]
@@ -677,7 +704,11 @@ def quote_market(
     if live_client is None:
         return
 
-    market_state = preflight_market_state if preflight_market_state is not None else LiveMarketState.load(live_client, token_quotes)
+    market_state = (
+        preflight_market_state
+        if preflight_market_state is not None
+        else LiveMarketState.load(live_client, token_quotes, config)
+    )
     stale_reason = preflight_stale_data_reason(token_quotes, market_state, time.monotonic(), config)
     if stale_reason is not None:
         print(f"skip live quote {_market_slug(market)}: stale live data ({stale_reason})")
@@ -716,7 +747,7 @@ def preflight_risk_audit(
             return PreflightRiskAudit(PreflightRiskAuditResult.SKIP_CYCLE, snapshots)
 
         try:
-            market_state = LiveMarketState.load(live_client, token_quotes)
+            market_state = LiveMarketState.load(live_client, token_quotes, config)
         except Exception as error:
             print(f"preflight risk audit skip {_market_slug(market)}: failed to fetch live state ({error})")
             return PreflightRiskAudit(PreflightRiskAuditResult.SKIP_CYCLE, snapshots)
@@ -1467,6 +1498,98 @@ def conditional_balance(client: ClobClient, token_id: str) -> Decimal:
     return balance / CONDITIONAL_TOKEN_BASE_UNITS
 
 
+def trades_for_token(
+    client: ClobClient,
+    token_id: str,
+    after_unix_secs: int | None,
+) -> list[Any]:
+    params = TradeParams(asset_id=token_id, after=after_unix_secs)
+    cursor: str | None = INITIAL_CURSOR
+    trades: list[Any] = []
+
+    while cursor is not None:
+        page = client.get_trades(params, next_cursor=cursor)
+        trades.extend(trade for trade in _response_list(page, "data") if is_filled_trade(trade))
+        next_cursor = str(_response_field(page, "next_cursor", "nextCursor") or END_CURSOR)
+        if next_cursor == END_CURSOR or next_cursor == cursor:
+            break
+        cursor = next_cursor
+
+    return trades
+
+
+def is_filled_trade(trade: Any) -> bool:
+    status = str(_response_field(trade, "status") or "").lower()
+    return status in {"matched", "mined", "confirmed"} or status.endswith((".matched", ".mined", ".confirmed"))
+
+
+def fill_record_from_trade(trade: Any) -> FillRecord:
+    return FillRecord(
+        id=str(_response_field(trade, "id", "trade_id", "tradeId")),
+        token_id=str(_response_field(trade, "asset_id", "token_id", "assetId", "tokenId")),
+        market=str(_response_field(trade, "market", "condition_id", "conditionId") or ""),
+        side=side_label(_response_field(trade, "side")),
+        size=_decimal(_response_field(trade, "size"), Decimal("0")),
+        price=_decimal(_response_field(trade, "price"), Decimal("0")),
+        status=str(_response_field(trade, "status") or ""),
+        matched_at_unix_secs=trade_matched_at_unix_secs(trade),
+    )
+
+
+def side_label(side: Any) -> str:
+    normalized = str(side or "").upper()
+    if normalized == BUY or normalized.endswith(f".{BUY}"):
+        return BUY
+    if normalized == SELL or normalized.endswith(f".{SELL}"):
+        return SELL
+    return "UNKNOWN"
+
+
+def trade_matched_at_unix_secs(trade: Any) -> int:
+    value = _response_field(trade, "match_time", "matchTime", "matched_at", "matchedAt", "timestamp")
+    if isinstance(value, (int, float)):
+        return int(value)
+    if value is not None:
+        raw = str(value)
+        try:
+            return int(raw)
+        except ValueError:
+            try:
+                return int(datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp())
+            except ValueError:
+                pass
+    return 0
+
+
+def token_cost_basis(
+    fill_records: list[FillRecord],
+    live_balance: Decimal,
+    fallback_fair_price: Decimal,
+) -> Decimal:
+    if live_balance <= Decimal("0"):
+        return Decimal("0")
+
+    position = Decimal("0")
+    cost = Decimal("0")
+    for record in fill_records:
+        if record.side == BUY:
+            position += record.size
+            cost += record.size * record.price
+        elif record.side == SELL and position > Decimal("0"):
+            sell_size = min(record.size, position)
+            avg_cost = cost / position
+            cost = max(cost - avg_cost * sell_size, Decimal("0"))
+            position = max(position - sell_size, Decimal("0"))
+
+    if position <= Decimal("0"):
+        return live_balance * fallback_fair_price
+
+    avg_cost = cost / position
+    if live_balance <= position:
+        return live_balance * avg_cost
+    return cost + (live_balance - position) * fallback_fair_price
+
+
 def proposed_order_from_open_order(order: Any, default_token_id: str) -> ProposedOrder | None:
     side = _response_field(order, "side")
     if side not in (BUY, SELL):
@@ -1753,6 +1876,8 @@ def _response_field(response: Any, *names: str) -> Any:
 
 
 def _response_list(response: Any, name: str) -> list[Any]:
+    if isinstance(response, list):
+        return response
     value = _response_field(response, name)
     return value if isinstance(value, list) else []
 

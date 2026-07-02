@@ -72,6 +72,8 @@ class Config:
     cycles: int
     refresh_secs: int
     state_path: Path
+    fill_state_path: Path
+    fill_max_records: int
     event_slug: str | None = None
 
 
@@ -121,6 +123,8 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
         cycles=args.cycles,
         refresh_secs=args.refresh_secs,
         state_path=args.state_path,
+        fill_state_path=args.fill_state_path,
+        fill_max_records=args.fill_max_records,
     )
     validate_config(config, parser)
     return config
@@ -326,10 +330,22 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path(_env_str("MARKET_MAKER_STATE_PATH", "state/seen-markets.json")),
     )
+    parser.add_argument(
+        "--fill-state-path",
+        type=_parse_path,
+        default=_parse_path(_env_str("MARKET_MAKER_FILL_STATE_PATH", "state/fills.json")),
+    )
+    parser.add_argument(
+        "--fill-max-records",
+        type=int,
+        default=_env_int("MARKET_MAKER_FILL_MAX_RECORDS", 10000),
+    )
     return parser
 
 
 def validate_config(config: Config, parser: argparse.ArgumentParser) -> None:
+    if config.fill_max_records <= 0:
+        parser.error("MARKET_MAKER_FILL_MAX_RECORDS must be greater than zero")
     if config.clear_pause and (config.cancel_all or config.cancel_all_on_exit):
         parser.error("MARKET_MAKER_CLEAR_PAUSE cannot be combined with cancel-all actions")
     if config.clear_pause:

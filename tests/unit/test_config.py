@@ -184,6 +184,14 @@ def test_zero_max_data_age_is_rejected(capsys):
     assert "MARKET_MAKER_MAX_DATA_AGE_SECS must be greater than zero" in captured.err
 
 
+def test_zero_fill_max_records_is_rejected(capsys):
+    with pytest.raises(SystemExit):
+        parse_args(["--fill-max-records", "0"])
+
+    captured = capsys.readouterr()
+    assert "MARKET_MAKER_FILL_MAX_RECORDS must be greater than zero" in captured.err
+
+
 def _live_args():
     return [
         "--live",

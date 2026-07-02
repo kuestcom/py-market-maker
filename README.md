@@ -81,11 +81,14 @@ would exceed the configured market loss cap. By default, live mode also
 requires a two-sided book with acceptable spread and top-of-book depth before
 quoting. After cancel requests, live mode refreshes open orders before posting
 replacements; after post responses, it only counts accepted orders as pending
-local exposure. Buy-side sizing is inventory-aware: token balances, live open
-buys, and pending buys are counted before adding more long exposure to an
-outcome or market. When current state already breaches inventory or market-loss
-caps, the bot skips new quotes and can optionally cancel resting buy orders. It
-can also write a pause file so later cycles or restarts stop before discovery.
+local exposure. Authenticated trade history is persisted in `state/fills.json`
+and used to value existing outcome-token balances at realized cost basis where
+possible; only uncovered balances fall back to current fair value. Buy-side
+sizing is inventory-aware: token balances, live open buys, and pending buys are
+counted before adding more long exposure to an outcome or market. When current
+state already breaches inventory or market-loss caps, the bot skips new quotes
+and can optionally cancel resting buy orders. It can also write a pause file so
+later cycles or restarts stop before discovery.
 
 By default live mode only posts buy orders.
 
@@ -191,7 +194,8 @@ emergency cancel target.
   Default: 25.
   Maximum simulated worst-case market loss allowed after existing balances,
   open orders, and the proposed new order are counted. Existing balances are
-  marked at current fair value because fill history is not tracked.
+  valued at realized cost basis from the persisted fill ledger where available;
+  only uncovered balances fall back to current fair value.
 
   --max-inventory-per-token / MARKET_MAKER_MAX_INVENTORY_PER_TOKEN
   Default: 25.
@@ -284,4 +288,14 @@ emergency cancel target.
 
   --state-path / MARKET_MAKER_STATE_PATH
   Default: state/seen-markets.json.
+
+  --fill-state-path / MARKET_MAKER_FILL_STATE_PATH
+  Default: state/fills.json.
+  Persisted authenticated trade ledger used to compute realized cost basis for
+  live outcome-token balances.
+
+  --fill-max-records / MARKET_MAKER_FILL_MAX_RECORDS
+  Default: 10000.
+  Maximum fill records retained in the persisted ledger. The oldest records are
+  pruned after each live state refresh to keep cycle latency bounded.
 ```
