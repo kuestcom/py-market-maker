@@ -73,7 +73,8 @@ Live mode requires `KUEST_PRIVATE_KEY`, `KUEST_DEPOSIT_WALLET`, and
 for Amoy.
 
 Before posting live orders, the bot blocks quotes whose simulated fill would
-exceed the configured market loss cap.
+exceed the configured market loss cap. By default, live mode also requires a
+two-sided book with acceptable spread and top-of-book depth before quoting.
 
 By default live mode only posts buy orders.
 
@@ -134,6 +135,20 @@ has zero balance for that outcome token and the order size is 5 shares
   Maximum simulated worst-case market loss allowed after existing balances,
   open orders, and the proposed new order are counted. Existing balances are
   marked at current fair value because fill history is not tracked.
+
+  --max-book-spread-ticks / MARKET_MAKER_MAX_BOOK_SPREAD_TICKS
+  Default: 20.
+  In live mode, when --require-two-sided-live is enabled, skip tokens when
+  best ask minus best bid is wider than this many ticks.
+
+  --min-top-depth / MARKET_MAKER_MIN_TOP_DEPTH
+  Default: 5.
+  In live mode, when --require-two-sided-live is enabled, skip tokens unless
+  both best bid and best ask have at least this much size at the top level.
+
+  --require-two-sided-live / MARKET_MAKER_REQUIRE_TWO_SIDED_LIVE
+  Default: true.
+  In live mode, require a valid two-sided book before quoting.
 
   --quote-sides / MARKET_MAKER_QUOTE_SIDES
   Default: buy. Values: buy, sell, both.

@@ -8,6 +8,7 @@ def test_event_slug_is_configurable():
 
     assert config.event_slug == "nba-finals"
     assert config.max_loss_per_market > 0
+    assert config.require_two_sided_live is True
 
 
 def test_empty_event_slug_is_rejected(capsys):
@@ -24,3 +25,19 @@ def test_zero_market_loss_limit_is_rejected(capsys):
 
     captured = capsys.readouterr()
     assert "MARKET_MAKER_MAX_LOSS_PER_MARKET must be greater than zero" in captured.err
+
+
+def test_zero_max_book_spread_is_rejected(capsys):
+    with pytest.raises(SystemExit):
+        parse_args(["--max-book-spread-ticks", "0"])
+
+    captured = capsys.readouterr()
+    assert "MARKET_MAKER_MAX_BOOK_SPREAD_TICKS must be greater than zero" in captured.err
+
+
+def test_negative_top_depth_is_rejected(capsys):
+    with pytest.raises(SystemExit):
+        parse_args(["--min-top-depth", "-1"])
+
+    captured = capsys.readouterr()
+    assert "MARKET_MAKER_MIN_TOP_DEPTH cannot be negative" in captured.err
