@@ -307,6 +307,9 @@ def _env_choice(name: str, default: str, choices: list[str]) -> str:
 
 def _parse_decimal(value: str) -> Decimal:
     try:
-        return Decimal(str(value))
+        parsed = Decimal(str(value))
     except InvalidOperation as error:
         raise argparse.ArgumentTypeError(f"{value} is not a decimal") from error
+    if not parsed.is_finite():
+        raise argparse.ArgumentTypeError(f"{value} must be a finite decimal")
+    return parsed

@@ -41,3 +41,11 @@ def test_negative_top_depth_is_rejected(capsys):
 
     captured = capsys.readouterr()
     assert "MARKET_MAKER_MIN_TOP_DEPTH cannot be negative" in captured.err
+
+
+def test_non_finite_top_depth_is_rejected(capsys):
+    with pytest.raises(SystemExit):
+        parse_args(["--min-top-depth", "NaN"])
+
+    captured = capsys.readouterr()
+    assert "NaN must be a finite decimal" in captured.err
