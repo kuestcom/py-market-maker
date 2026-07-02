@@ -122,6 +122,44 @@ def test_cancel_on_risk_breach_requires_live(capsys):
     assert "MARKET_MAKER_CANCEL_ON_RISK_BREACH requires --live" in captured.err
 
 
+def test_pause_on_risk_breach_requires_live(capsys):
+    with pytest.raises(SystemExit):
+        parse_args(["--pause-on-risk-breach"])
+
+    captured = capsys.readouterr()
+    assert "MARKET_MAKER_PAUSE_ON_RISK_BREACH requires --live" in captured.err
+
+
+def test_clear_pause_skips_trading_validation():
+    config = parse_args(["--clear-pause", "--live", "--order-size", "0"])
+
+    assert config.clear_pause is True
+    assert config.live is True
+    assert config.order_size == 0
+
+
+def test_clear_pause_rejects_cancel_all_actions(capsys):
+    with pytest.raises(SystemExit):
+        parse_args([*_live_args(), "--clear-pause", "--cancel-all"])
+
+    captured = capsys.readouterr()
+    assert "MARKET_MAKER_CLEAR_PAUSE cannot be combined with cancel-all actions" in captured.err
+
+    with pytest.raises(SystemExit):
+        parse_args([*_live_args(), "--clear-pause", "--cancel-all-on-exit"])
+
+    captured = capsys.readouterr()
+    assert "MARKET_MAKER_CLEAR_PAUSE cannot be combined with cancel-all actions" in captured.err
+
+
+def test_empty_pause_path_is_rejected(capsys):
+    with pytest.raises(SystemExit):
+        parse_args(["--pause-path", ""])
+
+    captured = capsys.readouterr()
+    assert "path cannot be empty" in captured.err
+
+
 def test_cancel_modes_are_mutually_exclusive(capsys):
     with pytest.raises(SystemExit):
         parse_args([*_live_args(), "--cancel-all", "--cancel-all-on-exit"])
