@@ -7,16 +7,26 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Callable
 
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderBookSummary, OrderSummary, OrderType
+from py_clob_client.clob_types import (
+    AssetType,
+    BalanceAllowanceParams,
+    OpenOrderParams,
+    OrderArgs,
+    OrderBookSummary,
+    OrderSummary,
+    OrderType,
+)
 from py_clob_client.constants import END_CURSOR
 from py_clob_client.order_builder.constants import BUY, SELL
 
 from .config import Config, DiscoveryMode
 from .event_scope import condition_id_from_market, condition_ids_from_site_config
+from .market_loss import MarketExposure, OutcomeExposure, ProposedOrder
 from .pricing import fair_price, quote_prices
 from .state import SeenMarkets
 
 INITIAL_CURSOR = "MA=="
+CONDITIONAL_TOKEN_BASE_UNITS = Decimal("1000000")
 
 
 @dataclass(frozen=True)
@@ -38,6 +48,75 @@ class QuotePlan:
     buy_price: Decimal | None
     sell_price: Decimal | None
     size: Decimal
+
+
+@dataclass(frozen=True)
+class TokenQuote:
+    token_id: str
+    fair_price: Decimal
+    plan: QuotePlan | None
+
+
+@dataclass
+class LiveTokenState:
+    token_id: str
+    fair_price: Decimal
+    balance: Decimal
+    open_orders: list[Any]
+
+
+@dataclass
+class LiveMarketState:
+    tokens: list[LiveTokenState]
+    pending_orders: list[ProposedOrder]
+
+    @classmethod
+    def load(cls, client: ClobClient, token_quotes: list[TokenQuote]) -> "LiveMarketState":
+        return cls(
+            tokens=[
+                LiveTokenState(
+                    token_id=token_quote.token_id,
+                    fair_price=token_quote.fair_price,
+                    balance=conditional_balance(client, token_quote.token_id),
+                    open_orders=open_orders_for_token(client, token_quote.token_id),
+                )
+                for token_quote in token_quotes
+            ],
+            pending_orders=[],
+        )
+
+    def exposure(self) -> MarketExposure:
+        exposure = MarketExposure(
+            outcomes=[
+                OutcomeExposure(
+                    token_id=token.token_id,
+                    position=token.balance,
+                    cost=token.balance * token.fair_price,
+                )
+                for token in self.tokens
+            ]
+        )
+        for token in self.tokens:
+            for order in token.open_orders:
+                proposed = proposed_order_from_open_order(order, token.token_id)
+                if proposed is not None:
+                    exposure.apply_order(proposed)
+        for order in self.pending_orders:
+            exposure.apply_order(order)
+        return exposure
+
+    def record_pending_order(self, order: ProposedOrder) -> None:
+        self.pending_orders.append(order)
+
+    def remove_open_orders(self, token_id: str, order_ids: set[str]) -> None:
+        if not order_ids:
+            return
+        for token in self.tokens:
+            if token.token_id == token_id:
+                token.open_orders = [
+                    order for order in token.open_orders if open_order_id(order) not in order_ids
+                ]
+                return
 
 
 def run(config: Config) -> None:
@@ -204,20 +283,49 @@ def quote_market(
     market: dict[str, Any],
     config: Config,
 ) -> None:
+    token_quotes: list[TokenQuote] = []
     for token in _market_tokens(market):
         token_id = _token_id(token)
         if not token_id:
             continue
 
         book = public_client.get_order_book(token_id)
-        plan = build_quote_plan(market, token, book, config)
-        if plan is None:
+        token_quote = build_token_quote(market, token, book, config)
+        token_quotes.append(token_quote)
+        if token_quote.plan is None:
             print(f"skip {_market_slug(market)} {_token_outcome(token)}: no safe quote at configured edge/sides")
             continue
 
-        print_plan(plan, config.live)
-        if live_client is not None:
-            post_quote_plan(live_client, plan, config)
+        print_plan(token_quote.plan, config.live)
+
+    if live_client is None:
+        return
+
+    market_state = LiveMarketState.load(live_client, token_quotes)
+    for token_quote in token_quotes:
+        if token_quote.plan is not None:
+            post_quote_plan(live_client, token_quote.plan, config, market_state)
+
+
+def build_token_quote(
+    market: dict[str, Any],
+    token: dict[str, Any],
+    book: OrderBookSummary,
+    config: Config,
+) -> TokenQuote:
+    best_bid_price = best_bid(book.bids or [])
+    best_ask_price = best_ask(book.asks or [])
+    fair = fair_price(
+        best_bid_price,
+        best_ask_price,
+        _decimal(_field(token, "price", "p"), Decimal("0")),
+        _decimal_or_none(book.last_trade_price),
+    )
+    return TokenQuote(
+        token_id=_token_id(token),
+        fair_price=fair,
+        plan=build_quote_plan(market, token, book, config),
+    )
 
 
 def build_quote_plan(
@@ -291,7 +399,12 @@ def print_plan(plan: QuotePlan, live: bool) -> None:
     )
 
 
-def post_quote_plan(client: ClobClient, plan: QuotePlan, config: Config) -> None:
+def post_quote_plan(
+    client: ClobClient,
+    plan: QuotePlan,
+    config: Config,
+    market_state: LiveMarketState,
+) -> None:
     if config.cancel_before_quote:
         response = client.cancel_market_orders(asset_id=plan.token_id)
         canceled = _response_list(response, "canceled")
@@ -301,9 +414,26 @@ def post_quote_plan(client: ClobClient, plan: QuotePlan, config: Config) -> None
                 f"canceled stale orders for {plan.token_id}: "
                 f"canceled={len(canceled)} not_canceled={len(not_canceled)}"
             )
+        market_state.remove_open_orders(
+            plan.token_id,
+            {order_id for item in canceled for order_id in [response_item_id(item)] if order_id},
+        )
 
     responses = []
-    if plan.buy_price is not None:
+    post_buy = plan.buy_price is not None
+    if post_buy:
+        proposed = ProposedOrder(
+            token_id=plan.token_id,
+            side=BUY,
+            price=plan.buy_price,
+            size=plan.size,
+        )
+        if market_loss_exceeds_cap(plan, proposed, market_state, config):
+            post_buy = False
+        else:
+            market_state.record_pending_order(proposed)
+
+    if post_buy:
         order = client.create_order(
             OrderArgs(
                 token_id=plan.token_id,
@@ -314,7 +444,20 @@ def post_quote_plan(client: ClobClient, plan: QuotePlan, config: Config) -> None
         )
         responses.append((BUY, client.post_order(order, orderType=OrderType.GTC, post_only=config.post_only)))
 
-    if plan.sell_price is not None:
+    post_sell = plan.sell_price is not None
+    if post_sell:
+        proposed = ProposedOrder(
+            token_id=plan.token_id,
+            side=SELL,
+            price=plan.sell_price,
+            size=plan.size,
+        )
+        if market_loss_exceeds_cap(plan, proposed, market_state, config):
+            post_sell = False
+        else:
+            market_state.record_pending_order(proposed)
+
+    if post_sell:
         order = client.create_order(
             OrderArgs(
                 token_id=plan.token_id,
@@ -326,6 +469,77 @@ def post_quote_plan(client: ClobClient, plan: QuotePlan, config: Config) -> None
         responses.append((SELL, client.post_order(order, orderType=OrderType.GTC, post_only=config.post_only)))
 
     print_post_responses(plan, responses)
+
+
+def market_loss_exceeds_cap(
+    plan: QuotePlan,
+    proposed_order: ProposedOrder,
+    market_state: LiveMarketState,
+    config: Config,
+) -> bool:
+    projected_loss = market_state.exposure().projected_loss(proposed_order)
+    if projected_loss <= config.max_loss_per_market:
+        return False
+
+    print(
+        f"skip {plan.market_slug} {plan.outcome} {proposed_order.side}: "
+        f"projected market loss {projected_loss} exceeds cap {config.max_loss_per_market}"
+    )
+    return True
+
+
+def open_orders_for_token(client: ClobClient, token_id: str) -> list[Any]:
+    orders = client.get_orders(OpenOrderParams(asset_id=token_id))
+    return orders if isinstance(orders, list) else []
+
+
+def conditional_balance(client: ClobClient, token_id: str) -> Decimal:
+    response = client.get_balance_allowance(
+        BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
+    )
+    balance = _decimal(_response_field(response, "balance"), Decimal("0"))
+    return balance / CONDITIONAL_TOKEN_BASE_UNITS
+
+
+def proposed_order_from_open_order(order: Any, default_token_id: str) -> ProposedOrder | None:
+    side = _response_field(order, "side")
+    if side not in (BUY, SELL):
+        return None
+
+    price = _decimal_or_none(_response_field(order, "price"))
+    if price is None:
+        return None
+
+    size = open_order_remaining_size(order)
+    if size <= Decimal("0"):
+        return None
+
+    token_id = str(_response_field(order, "asset_id", "token_id", "tokenId") or default_token_id)
+    return ProposedOrder(token_id=token_id, side=side, price=price, size=size)
+
+
+def open_order_remaining_size(order: Any) -> Decimal:
+    original_size = _decimal(
+        _response_field(order, "original_size", "originalSize", "size"),
+        Decimal("0"),
+    )
+    size_matched = _decimal(
+        _response_field(order, "size_matched", "sizeMatched"),
+        Decimal("0"),
+    )
+    return max(original_size - size_matched, Decimal("0"))
+
+
+def open_order_id(order: Any) -> str:
+    value = _response_field(order, "id", "order_id", "orderID")
+    return str(value) if value is not None else ""
+
+
+def response_item_id(item: Any) -> str:
+    if isinstance(item, str):
+        return item
+    value = _response_field(item, "id", "order_id", "orderID")
+    return str(value) if value is not None else ""
 
 
 def print_post_responses(plan: QuotePlan, responses: list[tuple[str, Any]]) -> None:

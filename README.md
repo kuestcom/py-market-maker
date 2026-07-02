@@ -72,6 +72,9 @@ Live mode requires `KUEST_PRIVATE_KEY`, `KUEST_DEPOSIT_WALLET`, and
 `--deposit-wallet`, and `--chain-id`. Use chain id `137` for Polygon or `80002`
 for Amoy.
 
+Before posting live orders, the bot blocks quotes whose simulated fill would
+exceed the configured market loss cap.
+
 By default live mode only posts buy orders.
 
 Use sell-side quoting only when the deposit wallet already owns outcome tokens
@@ -125,6 +128,12 @@ has zero balance for that outcome token and the order size is 5 shares
 
   --min-spread-ticks / MARKET_MAKER_MIN_SPREAD_TICKS
   Default: 2.
+
+  --max-loss-per-market / MARKET_MAKER_MAX_LOSS_PER_MARKET
+  Default: 25.
+  Maximum simulated worst-case market loss allowed after existing balances,
+  open orders, and the proposed new order are counted. Existing balances are
+  marked at current fair value because fill history is not tracked.
 
   --quote-sides / MARKET_MAKER_QUOTE_SIDES
   Default: buy. Values: buy, sell, both.

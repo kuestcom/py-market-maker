@@ -43,6 +43,7 @@ class Config:
     order_size: Decimal
     edge_ticks: int
     min_spread_ticks: int
+    max_loss_per_market: Decimal
     quote_sides: QuoteSides
     allow_single_sided: bool
     respect_reward_min_size: bool
@@ -72,6 +73,7 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
         order_size=args.order_size,
         edge_ticks=args.edge_ticks,
         min_spread_ticks=args.min_spread_ticks,
+        max_loss_per_market=args.max_loss_per_market,
         quote_sides=QuoteSides(args.quote_sides),
         allow_single_sided=args.allow_single_sided,
         respect_reward_min_size=args.respect_reward_min_size,
@@ -142,6 +144,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=_env_int("MARKET_MAKER_MIN_SPREAD_TICKS", 2),
     )
     parser.add_argument(
+        "--max-loss-per-market",
+        type=_parse_decimal,
+        default=_env_decimal("MARKET_MAKER_MAX_LOSS_PER_MARKET", Decimal("25")),
+    )
+    parser.add_argument(
         "--quote-sides",
         choices=[side.value for side in QuoteSides],
         default=_env_choice(
@@ -200,6 +207,8 @@ def validate_config(config: Config, parser: argparse.ArgumentParser) -> None:
         parser.error("MARKET_MAKER_EDGE_TICKS must be greater than zero")
     if config.min_spread_ticks <= 0:
         parser.error("MARKET_MAKER_MIN_SPREAD_TICKS must be greater than zero")
+    if config.max_loss_per_market <= Decimal("0"):
+        parser.error("MARKET_MAKER_MAX_LOSS_PER_MARKET must be greater than zero")
     if config.event_slug is not None and not config.event_slug.strip():
         parser.error("MARKET_MAKER_EVENT_SLUG cannot be empty")
     if config.cycles <= 0:
