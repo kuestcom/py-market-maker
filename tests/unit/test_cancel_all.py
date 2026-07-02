@@ -6,6 +6,7 @@ from py_market_maker import bot
 from py_market_maker.bot import (
     CANCEL_ORDER_BATCH_SIZE,
     MarketCandidate,
+    PreflightRiskAuditResult,
     ShutdownRequested,
     cancel_open_orders_for_markets,
     managed_token_ids,
@@ -117,6 +118,34 @@ def test_run_cycles_stops_before_discovery_when_paused(monkeypatch, tmp_path):
     )
 
     assert discovered == []
+
+
+def test_run_cycles_skips_quote_when_preflight_skips_cycle(monkeypatch, tmp_path):
+    quoted_markets = []
+
+    monkeypatch.setattr(
+        bot,
+        "discover_cycle_candidates",
+        lambda *_args, **_kwargs: [MarketCandidate(_market("market", ["yes"]), is_new=False)],
+    )
+    monkeypatch.setattr(
+        bot,
+        "preflight_risk_audit",
+        lambda *_args, **_kwargs: PreflightRiskAuditResult.SKIP_CYCLE,
+    )
+    monkeypatch.setattr(
+        bot,
+        "quote_market",
+        lambda _public_client, _live_client, market, _config: quoted_markets.append(market),
+    )
+
+    bot.run_cycles(
+        object(),
+        object(),
+        parse_args(["--pause-path", str(tmp_path / "paused.json")]),
+    )
+
+    assert quoted_markets == []
 
 
 class FakeClient:
