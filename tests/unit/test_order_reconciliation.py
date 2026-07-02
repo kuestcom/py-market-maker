@@ -62,9 +62,9 @@ def test_rejected_post_does_not_record_pending_order_and_refreshes_state():
     assert market_state.open_orders("yes") == []
 
 
-def test_failed_batch_response_dedupes_successful_pending_order_now_open():
+def test_failed_batch_response_dedupes_partially_filled_pending_order_now_open():
     market_state = _market_state(balance=Decimal("10"))
-    posted_buy = _open_order("posted-buy", BUY, "0.49", "5")
+    posted_buy = _open_order("posted-buy", BUY, "0.49", "3")
     client = FakeClient(
         open_order_pages={"yes": [[posted_buy]]},
         post_responses=[

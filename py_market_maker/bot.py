@@ -1039,11 +1039,12 @@ def open_order_matches_proposed(order: Any, proposed_order: ProposedOrder) -> bo
     token_id = str(_response_field(order, "asset_id", "token_id", "tokenId") or "")
     side = _response_field(order, "side")
     price = _decimal_or_none(_response_field(order, "price"))
+    remaining_size = open_order_remaining_size(order)
     return (
         token_id == proposed_order.token_id
         and side == proposed_order.side
         and price == proposed_order.price
-        and open_order_remaining_size(order) == proposed_order.size
+        and Decimal("0") < remaining_size <= proposed_order.size
     )
 
 
