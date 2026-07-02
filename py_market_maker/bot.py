@@ -511,7 +511,7 @@ def conditional_balance(client: ClobClient, token_id: str) -> Decimal:
 
 def proposed_order_from_open_order(order: Any, default_token_id: str) -> ProposedOrder | None:
     side = _response_field(order, "side")
-    if side is None:
+    if side not in (BUY, SELL):
         return None
 
     price = _decimal_or_none(_response_field(order, "price"))

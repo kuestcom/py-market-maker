@@ -4,6 +4,7 @@ from py_market_maker.bot import (
     LiveMarketState,
     LiveTokenState,
     open_order_remaining_size,
+    proposed_order_from_open_order,
 )
 from py_market_maker.market_loss import BUY, ProposedOrder
 
@@ -15,6 +16,18 @@ def test_open_order_remaining_size_uses_unmatched_size():
     }
 
     assert open_order_remaining_size(order) == Decimal("7.5")
+
+
+def test_unknown_open_order_side_is_ignored():
+    order = {
+        "asset_id": "yes",
+        "side": "HOLD",
+        "price": "0.40",
+        "original_size": "5",
+        "size_matched": "0",
+    }
+
+    assert proposed_order_from_open_order(order, "yes") is None
 
 
 def test_live_market_state_removes_canceled_open_orders_from_exposure():
