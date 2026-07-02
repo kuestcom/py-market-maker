@@ -1,7 +1,15 @@
+import signal
+
+import pytest
+
+from py_market_maker import bot
 from py_market_maker.bot import (
     CANCEL_ORDER_BATCH_SIZE,
+    MarketCandidate,
+    ShutdownRequested,
     cancel_open_orders_for_markets,
     managed_token_ids,
+    replace_managed_scope,
 )
 
 
@@ -35,6 +43,41 @@ def test_cancel_open_orders_for_markets_batches_and_verifies():
         [f"yes-{index}" for index in range(CANCEL_ORDER_BATCH_SIZE)],
         [f"yes-{CANCEL_ORDER_BATCH_SIZE}"],
     ]
+
+
+def test_replace_managed_scope_preserves_last_non_empty_scope():
+    first_market = _market("market-a", ["yes"])
+    second_market = _market("market-b", ["no"])
+    managed_scope = []
+
+    replace_managed_scope(managed_scope, [MarketCandidate(first_market, is_new=False)])
+    replace_managed_scope(managed_scope, [])
+
+    assert managed_scope == [first_market]
+
+    replace_managed_scope(managed_scope, [MarketCandidate(second_market, is_new=False)])
+
+    assert managed_scope == [second_market]
+
+
+def test_cancel_on_exit_preserves_signal_exit_code(monkeypatch):
+    canceled_scopes = []
+
+    def fake_run_cycles(_public_client, _live_client, _config, managed_scope=None):
+        managed_scope.append(_market("market", ["yes"]))
+        raise ShutdownRequested(signal.SIGTERM)
+
+    def fake_cancel_scope_orders(_public_client, _live_client, _config, managed_scope=None):
+        canceled_scopes.append(list(managed_scope))
+
+    monkeypatch.setattr(bot, "run_cycles", fake_run_cycles)
+    monkeypatch.setattr(bot, "cancel_scope_orders", fake_cancel_scope_orders)
+
+    with pytest.raises(SystemExit) as error:
+        bot.run_with_cancel_on_exit(object(), object(), object())
+
+    assert error.value.code == 128 + signal.SIGTERM
+    assert canceled_scopes == [[_market("market", ["yes"])]]
 
 
 class FakeClient:

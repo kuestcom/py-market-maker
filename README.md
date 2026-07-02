@@ -103,9 +103,12 @@ Ctrl-C or SIGTERM:
 python -m py_market_maker --live --cancel-all-on-exit --cycles 1000
 ```
 
-Both cancel modes are live-only. With `--event-slug`, they target only the
-selected event's markets. Without `--event-slug`, they target the normal
-discovery selection.
+Both cancel modes are live-only. With `--event-slug`, `--cancel-all` discovers
+the selected event's markets at startup, cancels their open orders, and exits.
+Without `--event-slug`, it targets the normal discovery selection.
+`--cancel-all-on-exit` uses the latest non-empty market scope managed while the
+bot was running, so a transient empty discovery cycle does not clear the
+emergency cancel target.
 
 ## CLI args / env vars
 
@@ -213,8 +216,8 @@ discovery selection.
 
   --cancel-all-on-exit / MARKET_MAKER_CANCEL_ALL_ON_EXIT
   Default: false.
-  In live mode, cancel open orders in the latest managed market scope when the
-  process is interrupted.
+  In live mode, cancel open orders in the latest non-empty managed market scope
+  when the process is interrupted.
 
   --post-only / MARKET_MAKER_POST_ONLY
   Default: true.

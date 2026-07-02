@@ -208,7 +208,9 @@ class LiveMarketState:
 
 
 class ShutdownRequested(Exception):
-    pass
+    def __init__(self, signum: int):
+        self.signum = signum
+        super().__init__(f"received signal {signum}")
 
 
 def run(config: Config) -> None:
@@ -232,15 +234,20 @@ def run_with_cancel_on_exit(public_client: ClobClient, live_client: ClobClient, 
     previous_sigterm = signal.getsignal(signal.SIGTERM)
 
     def request_shutdown(signum: int, _frame: Any) -> None:
-        raise ShutdownRequested(f"received signal {signum}")
+        raise ShutdownRequested(signum)
 
     signal.signal(signal.SIGINT, request_shutdown)
     signal.signal(signal.SIGTERM, request_shutdown)
     try:
         run_cycles(public_client, live_client, config, managed_scope)
-    except (KeyboardInterrupt, ShutdownRequested) as error:
+    except ShutdownRequested as error:
         print(f"shutdown requested: {error}; canceling scoped open orders")
         cancel_scope_orders(public_client, live_client, config, managed_scope)
+        raise SystemExit(128 + error.signum) from error
+    except KeyboardInterrupt:
+        print("shutdown requested: keyboard interrupt; canceling scoped open orders")
+        cancel_scope_orders(public_client, live_client, config, managed_scope)
+        raise
     finally:
         signal.signal(signal.SIGINT, previous_sigint)
         signal.signal(signal.SIGTERM, previous_sigterm)
@@ -303,6 +310,8 @@ def discover_cycle_candidates(
 
 
 def replace_managed_scope(managed_scope: list[dict[str, Any]], candidates: list[MarketCandidate]) -> None:
+    if not candidates:
+        return
     managed_scope[:] = [candidate.market for candidate in candidates]
 
 
