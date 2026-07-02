@@ -81,7 +81,9 @@ replacements; after post responses, it only counts accepted orders as pending
 local exposure. It also skips live posts when order books, token balances, or
 open orders are older than the configured data-age limit. Buy-side sizing is
 inventory-aware: token balances, live open buys, and pending buys are counted
-before adding more long exposure to an outcome or market.
+before adding more long exposure to an outcome or market. When current state
+already breaches inventory or market-loss caps, the bot skips new quotes and
+can optionally cancel resting buy orders.
 
 By default live mode only posts buy orders.
 
@@ -237,6 +239,12 @@ emergency cancel target.
   Default: false.
   In live mode, cancel open orders in the latest non-empty managed market scope
   when the process is interrupted.
+
+  --cancel-on-risk-breach / MARKET_MAKER_CANCEL_ON_RISK_BREACH
+  Default: false.
+  Live-only circuit-breaker action. When current state already breaches
+  inventory or market-loss caps, skip new quotes and cancel resting buy orders
+  for the breached token.
 
   --post-only / MARKET_MAKER_POST_ONLY
   Default: true.

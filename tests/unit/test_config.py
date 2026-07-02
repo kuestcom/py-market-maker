@@ -114,6 +114,14 @@ def test_cancel_all_on_exit_requires_live(capsys):
     assert "MARKET_MAKER_CANCEL_ALL and MARKET_MAKER_CANCEL_ALL_ON_EXIT require --live" in captured.err
 
 
+def test_cancel_on_risk_breach_requires_live(capsys):
+    with pytest.raises(SystemExit):
+        parse_args(["--cancel-on-risk-breach"])
+
+    captured = capsys.readouterr()
+    assert "MARKET_MAKER_CANCEL_ON_RISK_BREACH requires --live" in captured.err
+
+
 def test_cancel_modes_are_mutually_exclusive(capsys):
     with pytest.raises(SystemExit):
         parse_args([*_live_args(), "--cancel-all", "--cancel-all-on-exit"])

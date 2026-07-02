@@ -225,6 +225,122 @@ def test_buy_is_skipped_when_inventory_room_is_below_minimum():
     assert market_state.pending_orders == []
 
 
+def test_risk_breaches_detect_token_inventory_over_limit():
+    market_state = _market_state(balance=Decimal("11"))
+    breaches = market_state.risk_breaches(parse_args(["--max-inventory-per-token", "10"]))
+
+    assert any(
+        breach.kind == "token_inventory"
+        and breach.token_id == "yes"
+        and breach.value == Decimal("11")
+        and breach.limit == Decimal("10")
+        for breach in breaches
+    )
+
+
+def test_risk_breaches_detect_market_inventory_over_limit():
+    market_state = _market_state(balance=Decimal("8"), no_balance=Decimal("8"))
+    breaches = market_state.risk_breaches(parse_args(["--max-inventory-per-market", "15"]))
+
+    assert any(
+        breach.kind == "market_inventory"
+        and breach.value == Decimal("16")
+        and breach.limit == Decimal("15")
+        for breach in breaches
+    )
+
+
+def test_risk_breaches_detect_market_loss_over_limit():
+    market_state = _market_state(balance=Decimal("5"))
+    breaches = market_state.risk_breaches(parse_args(["--max-loss-per-market", "2"]))
+
+    assert any(
+        breach.kind == "market_loss"
+        and breach.value == Decimal("2.50")
+        and breach.limit == Decimal("2")
+        for breach in breaches
+    )
+
+
+def test_risk_breach_skips_new_quotes_without_canceling_by_default():
+    open_buy = _open_order("open-buy", BUY, "0.49", "5")
+    market_state = _market_state(open_orders=[open_buy], balance=Decimal("11"))
+    client = FakeClient(post_responses=[_post_response(True, "posted")])
+
+    post_quote_plan(
+        client,
+        _plan(buy_band=_buy_band()),
+        parse_args(["--max-inventory-per-token", "10"]),
+        market_state,
+    )
+
+    assert client.cancel_batches == []
+    assert client.created_orders == []
+    assert client.posted_orders == []
+    assert market_state.open_orders("yes") == [open_buy]
+
+
+def test_cancel_on_risk_breach_cancels_open_buys_and_refreshes_state():
+    open_buy = _open_order("open-buy", BUY, "0.49", "5")
+    open_sell = _open_order("open-sell", SELL, "0.51", "5")
+    market_state = _market_state(open_orders=[open_buy, open_sell], balance=Decimal("11"))
+    client = FakeClient(open_order_pages={"yes": [[open_sell]]})
+
+    post_quote_plan(
+        client,
+        _plan(buy_band=_buy_band(), sell_band=_sell_band()),
+        parse_args([
+            "--live",
+            "--private-key",
+            "0xabc",
+            "--deposit-wallet",
+            "0xdef",
+            "--chain-id",
+            "137",
+            "--cancel-on-risk-breach",
+            "--max-inventory-per-token",
+            "10",
+        ]),
+        market_state,
+    )
+
+    assert client.cancel_batches == [["open-buy"]]
+    assert client.get_order_tokens == ["yes"]
+    assert client.created_orders == []
+    assert client.posted_orders == []
+    assert market_state.open_orders("yes") == [open_sell]
+
+
+def test_cancel_on_risk_breach_does_not_cancel_unrelated_token_buys():
+    open_buy = _open_order("open-buy", BUY, "0.49", "5")
+    market_state = _market_state(open_orders=[open_buy], no_balance=Decimal("11"))
+    client = FakeClient(post_responses=[_post_response(True, "posted")])
+
+    post_quote_plan(
+        client,
+        _plan(buy_band=_buy_band()),
+        parse_args([
+            "--live",
+            "--private-key",
+            "0xabc",
+            "--deposit-wallet",
+            "0xdef",
+            "--chain-id",
+            "137",
+            "--cancel-on-risk-breach",
+            "--max-inventory-per-token",
+            "10",
+        ]),
+        market_state,
+    )
+
+    assert client.cancel_batches == []
+    assert client.get_order_tokens == []
+    assert client.created_orders == []
+    assert client.posted_orders == []
+    assert market_state.open_orders("yes") == [open_buy]
+
+
 class FakeClient:
     def __init__(self, open_order_pages=None, post_responses=None):
         self.open_order_pages = {
@@ -261,7 +377,7 @@ class FakeClient:
         return self.post_responses.pop(0)
 
 
-def _market_state(open_orders=None, balance=Decimal("0"), now=None):
+def _market_state(open_orders=None, balance=Decimal("0"), no_balance=Decimal("0"), now=None):
     now = bot.time.monotonic() if now is None else now
     return LiveMarketState(
         tokens=[
@@ -273,7 +389,7 @@ def _market_state(open_orders=None, balance=Decimal("0"), now=None):
                 open_orders=list(open_orders or []),
                 open_orders_fetched_at=now,
             ),
-            LiveTokenState("no", Decimal("0.50"), Decimal("0"), now, [], now),
+            LiveTokenState("no", Decimal("0.50"), no_balance, now, [], now),
         ],
         pending_orders=[],
     )
