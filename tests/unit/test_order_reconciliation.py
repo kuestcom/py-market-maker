@@ -16,12 +16,14 @@ from py_market_maker.bot import (
     inventory_adjusted_buy_size,
     pre_post_liquidity_reject_reason,
     price_move_reject_reason,
+    position_reconcile_error_for,
     preflight_risk_audit,
     preflight_snapshot_for_market,
     preflight_stale_data_reason,
     quote_market,
     stale_input_reason,
     token_cost_basis,
+    token_ledger_position,
 )
 from py_market_maker.config import parse_args
 from py_market_maker.market_loss import BUY, SELL, ProposedOrder
@@ -259,6 +261,52 @@ def test_token_cost_basis_falls_back_for_uncovered_balance():
     assert token_cost_basis(records, Decimal("5"), Decimal("0.50")) == Decimal("2.30")
 
 
+def test_token_ledger_position_tracks_buys_and_sells():
+    records = [
+        _fill_record("buy-a", "yes", BUY, "10", "0.40", 1),
+        _fill_record("sell-a", "yes", SELL, "4", "0.70", 2),
+    ]
+
+    assert token_ledger_position(records) == Decimal("6")
+
+
+def test_position_reconcile_error_respects_tolerance():
+    assert position_reconcile_error_for(
+        Decimal("6.0000005"),
+        Decimal("6"),
+        Decimal("0.000001"),
+    ) is None
+
+    error = position_reconcile_error_for(
+        Decimal("7"),
+        Decimal("6"),
+        Decimal("0.000001"),
+    )
+
+    assert error is not None
+    assert error.live_balance == Decimal("7")
+    assert error.ledger_position == Decimal("6")
+    assert error.difference == Decimal("1")
+    assert error.tolerance == Decimal("0.000001")
+
+
+def test_market_state_reports_unreconciled_position():
+    market_state = _market_state(
+        balance=Decimal("7"),
+        position_reconcile_error=position_reconcile_error_for(
+            Decimal("7"),
+            Decimal("6"),
+            Decimal("0.000001"),
+        ),
+    )
+
+    reason = market_state.position_reconcile_reject_reason()
+
+    assert reason is not None
+    assert "token yes" in reason
+    assert "live balance 7" in reason
+
+
 def test_exposure_uses_token_cost_basis_for_existing_balances():
     market_state = _market_state(balance=Decimal("5"), cost_basis=Decimal("2"))
 
@@ -306,6 +354,51 @@ def test_live_market_state_fetches_fills_and_uses_cost_basis(tmp_path):
     assert market_state.token_state("yes").cost_basis == Decimal("2.00")
     assert market_state.exposure().worst_loss() == Decimal("2.00")
     assert FillLedger.load(tmp_path / "fills.json").latest_matched_at_unix_secs("yes") == 100
+
+
+def test_live_market_state_records_position_reconcile_error(tmp_path):
+    token_quotes = [
+        TokenQuote(
+            token_id="yes",
+            outcome="Yes",
+            fair_price=Decimal("0.50"),
+            book_fetched_at=bot.time.monotonic(),
+            plan=None,
+            skip_reason=None,
+        )
+    ]
+    client = FakeClient(
+        balances={"yes": Decimal("7")},
+        trade_pages={
+            "yes": [[{
+                "id": "trade-a",
+                "asset_id": "yes",
+                "market": "market",
+                "side": BUY,
+                "size": "6",
+                "price": "0.40",
+                "status": "Matched",
+                "match_time": 100,
+            }]]
+        },
+    )
+
+    market_state = LiveMarketState.load(
+        client,
+        token_quotes,
+        parse_args([
+            "--fill-state-path",
+            str(tmp_path / "fills.json"),
+            "--position-reconcile-tolerance",
+            "0.000001",
+        ]),
+    )
+
+    reason = market_state.position_reconcile_reject_reason()
+
+    assert reason is not None
+    assert "live balance 7" in reason
+    assert "fill-ledger position 6" in reason
 
 
 def test_inventory_buy_room_counts_balance_and_open_buys():
@@ -650,6 +743,18 @@ def test_preflight_risk_audit_returns_market_snapshots():
     client = FakeClient(
         books={"yes": _book()},
         balances={"yes": Decimal("1")},
+        trade_pages={
+            "yes": [[{
+                "id": "trade-a",
+                "asset_id": "yes",
+                "market": "market",
+                "side": BUY,
+                "size": "1",
+                "price": "0.40",
+                "status": "Matched",
+                "match_time": 100,
+            }]]
+        },
     )
 
     result = preflight_risk_audit(
@@ -766,7 +871,14 @@ class FakeClient:
         return self.post_responses.pop(0)
 
 
-def _market_state(open_orders=None, balance=Decimal("0"), no_balance=Decimal("0"), cost_basis=None, now=None):
+def _market_state(
+    open_orders=None,
+    balance=Decimal("0"),
+    no_balance=Decimal("0"),
+    cost_basis=None,
+    position_reconcile_error=None,
+    now=None,
+):
     now = bot.time.monotonic() if now is None else now
     return LiveMarketState(
         tokens=[
@@ -778,6 +890,7 @@ def _market_state(open_orders=None, balance=Decimal("0"), no_balance=Decimal("0"
                 open_orders=list(open_orders or []),
                 open_orders_fetched_at=now,
                 cost_basis=cost_basis,
+                position_reconcile_error=position_reconcile_error,
             ),
             LiveTokenState("no", Decimal("0.50"), no_balance, now, [], now),
         ],

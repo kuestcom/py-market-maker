@@ -204,6 +204,15 @@ class LiveTokenState:
     open_orders: list[Any]
     open_orders_fetched_at: float
     cost_basis: Decimal | None = None
+    position_reconcile_error: "PositionReconcileError | None" = None
+
+
+@dataclass(frozen=True)
+class PositionReconcileError:
+    live_balance: Decimal
+    ledger_position: Decimal
+    difference: Decimal
+    tolerance: Decimal
 
 
 @dataclass
@@ -235,6 +244,16 @@ class LiveMarketState:
             balance = conditional_balance(client, token_quote.token_id)
             balance_fetched_at = time.monotonic()
             fill_records = fill_ledger.records_for_token(token_quote.token_id)
+            ledger_position = token_ledger_position(fill_records)
+            position_reconcile_error = (
+                position_reconcile_error_for(
+                    balance,
+                    ledger_position,
+                    config.position_reconcile_tolerance,
+                )
+                if config is not None
+                else None
+            )
             cost_basis = token_cost_basis(fill_records, balance, token_quote.fair_price)
             open_orders = open_orders_for_token(client, token_quote.token_id)
             open_orders_fetched_at = time.monotonic()
@@ -247,6 +266,7 @@ class LiveMarketState:
                     open_orders=open_orders,
                     open_orders_fetched_at=open_orders_fetched_at,
                     cost_basis=cost_basis,
+                    position_reconcile_error=position_reconcile_error,
                 )
             )
         if config is not None:
@@ -278,6 +298,18 @@ class LiveMarketState:
 
     def record_pending_order(self, order: ProposedOrder) -> None:
         self.pending_orders.append(order)
+
+    def position_reconcile_reject_reason(self) -> str | None:
+        for token_state in self.tokens:
+            error = token_state.position_reconcile_error
+            if error is None:
+                continue
+            return (
+                f"token {token_state.token_id} live balance {error.live_balance} "
+                f"differs from fill-ledger position {error.ledger_position} "
+                f"by {error.difference} (tolerance {error.tolerance})"
+            )
+        return None
 
     def open_orders(self, token_id: str) -> list[Any]:
         token = self.token_state(token_id)
@@ -713,6 +745,10 @@ def quote_market(
     if stale_reason is not None:
         print(f"skip live quote {_market_slug(market)}: stale live data ({stale_reason})")
         return
+    position_reason = market_state.position_reconcile_reject_reason()
+    if position_reason is not None:
+        print(f"skip live quote {_market_slug(market)}: position reconciliation failed ({position_reason})")
+        return
 
     for token_quote in token_quotes:
         if stop_if_paused(config):
@@ -767,6 +803,14 @@ def preflight_risk_audit(
                 PauseState.save_reason(config.pause_path, reason)
                 print(f"wrote pause file {config.pause_path}: {reason}")
                 return PreflightRiskAudit(PreflightRiskAuditResult.STOP, snapshots)
+            return PreflightRiskAudit(PreflightRiskAuditResult.SKIP_CYCLE, snapshots)
+
+        position_reason = market_state.position_reconcile_reject_reason()
+        if position_reason is not None:
+            print(
+                f"preflight risk audit skip {_market_slug(market)}: "
+                f"position reconciliation failed ({position_reason})"
+            )
             return PreflightRiskAudit(PreflightRiskAuditResult.SKIP_CYCLE, snapshots)
 
         snapshots.append(
@@ -1044,6 +1088,10 @@ def post_quote_plan(
     stale_reason = stale_live_data_reason(plan, market_state, time.monotonic(), config)
     if stale_reason is not None:
         print(f"skip placing {plan.market_slug} {plan.outcome}: stale live data ({stale_reason})")
+        return
+    position_reason = market_state.position_reconcile_reject_reason()
+    if position_reason is not None:
+        print(f"skip placing {plan.market_slug} {plan.outcome}: position reconciliation failed ({position_reason})")
         return
 
     if config.cancel_before_quote:
@@ -1588,6 +1636,32 @@ def token_cost_basis(
     if live_balance <= position:
         return live_balance * avg_cost
     return cost + (live_balance - position) * fallback_fair_price
+
+
+def token_ledger_position(fill_records: list[FillRecord]) -> Decimal:
+    position = Decimal("0")
+    for record in fill_records:
+        if record.side == BUY:
+            position += record.size
+        elif record.side == SELL:
+            position -= record.size
+    return position
+
+
+def position_reconcile_error_for(
+    live_balance: Decimal,
+    ledger_position: Decimal,
+    tolerance: Decimal,
+) -> PositionReconcileError | None:
+    difference = abs(live_balance - ledger_position)
+    if difference <= tolerance:
+        return None
+    return PositionReconcileError(
+        live_balance=live_balance,
+        ledger_position=ledger_position,
+        difference=difference,
+        tolerance=tolerance,
+    )
 
 
 def proposed_order_from_open_order(order: Any, default_token_id: str) -> ProposedOrder | None:

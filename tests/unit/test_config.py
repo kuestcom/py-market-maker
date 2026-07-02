@@ -192,6 +192,14 @@ def test_zero_fill_max_records_is_rejected(capsys):
     assert "MARKET_MAKER_FILL_MAX_RECORDS must be greater than zero" in captured.err
 
 
+def test_negative_position_reconcile_tolerance_is_rejected(capsys):
+    with pytest.raises(SystemExit):
+        parse_args(["--position-reconcile-tolerance", "-0.000001"])
+
+    captured = capsys.readouterr()
+    assert "MARKET_MAKER_POSITION_RECONCILE_TOLERANCE cannot be negative" in captured.err
+
+
 def test_clear_pause_skips_fill_max_records_validation():
     config = parse_args(["--clear-pause", "--fill-max-records", "0"])
 

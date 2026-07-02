@@ -82,13 +82,14 @@ requires a two-sided book with acceptable spread and top-of-book depth before
 quoting. After cancel requests, live mode refreshes open orders before posting
 replacements; after post responses, it only counts accepted orders as pending
 local exposure. Authenticated trade history is persisted in `state/fills.json`
-and used to value existing outcome-token balances at realized cost basis where
-possible; only uncovered balances fall back to current fair value. Buy-side
-sizing is inventory-aware: token balances, live open buys, and pending buys are
-counted before adding more long exposure to an outcome or market. When current
-state already breaches inventory or market-loss caps, the bot skips new quotes
-and can optionally cancel resting buy orders. It can also write a pause file so
-later cycles or restarts stop before discovery.
+and used to value existing outcome-token balances at realized cost basis. If
+the persisted fill ledger cannot explain the live token balance within the
+configured position tolerance, live mode skips quoting that market for the
+cycle. Buy-side sizing is inventory-aware: token balances, live open buys, and
+pending buys are counted before adding more long exposure to an outcome or
+market. When current state already breaches inventory or market-loss caps, the
+bot skips new quotes and can optionally cancel resting buy orders. It can also
+write a pause file so later cycles or restarts stop before discovery.
 
 By default live mode only posts buy orders.
 
@@ -194,8 +195,8 @@ emergency cancel target.
   Default: 25.
   Maximum simulated worst-case market loss allowed after existing balances,
   open orders, and the proposed new order are counted. Existing balances are
-  valued at realized cost basis from the persisted fill ledger where available;
-  only uncovered balances fall back to current fair value.
+  valued at realized cost basis from the persisted fill ledger; live quoting is
+  skipped when the ledger and live balance do not reconcile.
 
   --max-inventory-per-token / MARKET_MAKER_MAX_INVENTORY_PER_TOKEN
   Default: 25.
@@ -298,4 +299,9 @@ emergency cancel target.
   Default: 10000.
   Maximum fill records retained in the persisted ledger. The oldest records are
   pruned after each live state refresh to keep cycle latency bounded.
+
+  --position-reconcile-tolerance / MARKET_MAKER_POSITION_RECONCILE_TOLERANCE
+  Default: 0.000001.
+  Maximum allowed difference between live token balance and fill-ledger
+  position. Larger mismatches skip live quoting because cost basis is uncertain.
 ```
