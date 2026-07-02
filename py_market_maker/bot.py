@@ -700,7 +700,8 @@ def preflight_risk_audit(
                 reason = preflight_breach_pause_reason(market, breaches)
                 PauseState.save_reason(config.pause_path, reason)
                 print(f"wrote pause file {config.pause_path}: {reason}")
-            return PreflightRiskAuditResult.STOP
+                return PreflightRiskAuditResult.STOP
+            return PreflightRiskAuditResult.SKIP_CYCLE
 
     return PreflightRiskAuditResult.CONTINUE
 

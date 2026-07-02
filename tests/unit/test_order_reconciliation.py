@@ -480,6 +480,33 @@ def test_preflight_risk_audit_cancels_and_pauses_on_market_breach(tmp_path):
     assert pause.reason == "preflight risk breach market: token yes inventory 16 exceeds limit 10"
 
 
+def test_preflight_risk_audit_skips_cycle_on_breach_without_pause():
+    client = FakeClient(
+        books={"yes": _book()},
+        balances={"yes": Decimal("11")},
+    )
+
+    result = preflight_risk_audit(
+        client,
+        client,
+        [_market()],
+        parse_args([
+            "--live",
+            "--private-key",
+            "0xabc",
+            "--deposit-wallet",
+            "0xdef",
+            "--chain-id",
+            "137",
+            "--max-inventory-per-token",
+            "10",
+        ]),
+    )
+
+    assert result == PreflightRiskAuditResult.SKIP_CYCLE
+    assert client.cancel_batches == []
+
+
 class FakeClient:
     def __init__(self, open_order_pages=None, post_responses=None, books=None, balances=None):
         self.open_order_pages = {

@@ -75,18 +75,17 @@ for Amoy.
 
 Live mode runs a preflight risk audit on the selected market scope before
 quoting. It fetches current books, balances, and open orders; skips the cycle
-if those inputs cannot be fetched or are stale; and stops before quoting if
-current exposure already breaches configured risk caps. Before posting live
-orders, the bot blocks quotes whose simulated fill would exceed the configured
-market loss cap. By default, live mode also requires a two-sided book with
-acceptable spread and top-of-book depth before quoting. After cancel requests,
-live mode refreshes open orders before posting replacements; after post
-responses, it only counts accepted orders as pending local exposure. Buy-side
-sizing is inventory-aware: token balances, live open buys, and pending buys are
-counted before adding more long exposure to an outcome or market. When current
-state already breaches inventory or market-loss caps, the bot skips new quotes
-and can optionally cancel resting buy orders. It can also write a pause file so
-later cycles or restarts stop before discovery.
+if those inputs cannot be fetched, are stale, or already breach configured risk
+caps. Before posting live orders, the bot blocks quotes whose simulated fill
+would exceed the configured market loss cap. By default, live mode also
+requires a two-sided book with acceptable spread and top-of-book depth before
+quoting. After cancel requests, live mode refreshes open orders before posting
+replacements; after post responses, it only counts accepted orders as pending
+local exposure. Buy-side sizing is inventory-aware: token balances, live open
+buys, and pending buys are counted before adding more long exposure to an
+outcome or market. When current state already breaches inventory or market-loss
+caps, the bot skips new quotes and can optionally cancel resting buy orders. It
+can also write a pause file so later cycles or restarts stop before discovery.
 
 By default live mode only posts buy orders.
 
