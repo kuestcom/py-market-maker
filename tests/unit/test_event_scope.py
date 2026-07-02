@@ -3,6 +3,7 @@ import json
 import pytest
 
 from py_market_maker.event_scope import (
+    condition_id_from_market,
     condition_ids_from_site_config,
     fetch_site_events,
     site_url_from_config,
@@ -34,8 +35,8 @@ def test_condition_ids_from_site_config_uses_matching_event(tmp_path):
             {
                 "slug": "target-event",
                 "markets": [
-                    {"condition_id": "0x02"},
-                    {"conditionId": "0x03"},
+                    {"condition_id": "0x02", "outcomes": [{"token_id": "100"}]},
+                    {"conditionId": "0x03", "clob_token_ids": ["101"]},
                     {"condition_id": ""},
                     {},
                 ],
@@ -43,6 +44,36 @@ def test_condition_ids_from_site_config_uses_matching_event(tmp_path):
         ]
 
     assert condition_ids_from_site_config("target-event", 5, path, get_json) == {"0x02", "0x03"}
+
+
+def test_condition_ids_from_site_config_ignores_non_clob_event_markets(tmp_path):
+    path = tmp_path / ".sdk" / "site-config.json"
+    path.parent.mkdir()
+    path.write_text(json.dumps({"site_url": "https://kuest.example"}), encoding="utf-8")
+
+    def get_json(url):
+        return [
+            {
+                "slug": "target-event",
+                "markets": [
+                    {"condition_id": "0xlegacy"},
+                    {"condition_id": "0xclob-a", "outcomes": [{"token_id": "100"}]},
+                    {"condition_id": "0xclob-b", "enable_order_book": True},
+                ],
+            },
+        ]
+
+    assert condition_ids_from_site_config("target-event", 1, path, get_json) == {
+        "0xclob-a",
+        "0xclob-b",
+    }
+
+
+def test_condition_id_from_market_supports_all_known_keys():
+    assert condition_id_from_market({"condition_id": "0x01"}) == "0x01"
+    assert condition_id_from_market({"conditionId": "0x02"}) == "0x02"
+    assert condition_id_from_market({"conditionID": "0x03"}) == "0x03"
+    assert condition_id_from_market({"c": "0x04"}) == "0x04"
 
 
 def test_fetch_site_events_paginates_until_short_page():

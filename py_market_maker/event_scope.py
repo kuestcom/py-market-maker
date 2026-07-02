@@ -11,6 +11,10 @@ SITE_CONFIG_PATH = Path(".sdk/site-config.json")
 SITE_EVENTS_LIMIT = 100
 
 JsonGetter = Callable[[str], Any]
+CONDITION_ID_KEYS = ("condition_id", "conditionId", "conditionID", "c")
+TOKEN_ID_KEYS = ("token_id", "tokenId", "asset_id", "assetId", "t")
+CLOB_TOKEN_LIST_KEYS = ("clob_token_ids", "clobTokenIds", "outcome_assets", "outcomeAssets")
+NESTED_MARKET_KEYS = ("markets", "outcomes", "tokens")
 
 
 def condition_ids_from_site_config(
@@ -32,7 +36,8 @@ def condition_ids_from_site_config(
             condition_id
             for market in markets
             if isinstance(market, dict)
-            for condition_id in [_condition_id(market)]
+            if is_clob_market_entry(market)
+            for condition_id in [condition_id_from_market(market)]
             if condition_id
         }
 
@@ -111,11 +116,53 @@ def _get_json(url: str) -> Any:
         raise RuntimeError(f"failed to parse site events from {url}") from error
 
 
-def _condition_id(market: dict[str, Any]) -> str | None:
-    for key in ("condition_id", "conditionId", "conditionID", "c"):
+def condition_id_from_market(market: dict[str, Any]) -> str | None:
+    for key in CONDITION_ID_KEYS:
         value = market.get(key)
         if value is not None:
             text = str(value).strip()
             if text:
                 return text
     return None
+
+
+def is_clob_market_entry(market: dict[str, Any]) -> bool:
+    if condition_id_from_market(market) is None:
+        return False
+    if _bool_field(market, "enable_order_book"):
+        return True
+    return _has_token_evidence(market)
+
+
+def _has_token_evidence(value: Any) -> bool:
+    if isinstance(value, dict):
+        if any(_token_id(value.get(key)) for key in TOKEN_ID_KEYS):
+            return True
+        for key in CLOB_TOKEN_LIST_KEYS:
+            if _has_token_evidence(value.get(key)):
+                return True
+        for key in NESTED_MARKET_KEYS:
+            if _has_token_evidence(value.get(key)):
+                return True
+        return False
+
+    if isinstance(value, list):
+        return any(_has_token_evidence(item) for item in value)
+
+    return _token_id(value) is not None
+
+
+def _token_id(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _bool_field(source: dict[str, Any], name: str) -> bool:
+    value = source.get(name)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "y", "on")
+    return bool(value)

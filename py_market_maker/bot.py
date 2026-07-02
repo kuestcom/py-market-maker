@@ -4,7 +4,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, Callable
 
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderBookSummary, OrderSummary, OrderType
@@ -12,7 +12,7 @@ from py_clob_client.constants import END_CURSOR
 from py_clob_client.order_builder.constants import BUY, SELL
 
 from .config import Config, DiscoveryMode
-from .event_scope import condition_ids_from_site_config
+from .event_scope import condition_id_from_market, condition_ids_from_site_config
 from .pricing import fair_price, quote_prices
 from .state import SeenMarkets
 
@@ -138,28 +138,27 @@ def select_candidates(
     seen: SeenMarkets,
     max_markets: int,
 ) -> list[MarketCandidate]:
-    candidates = [
-        MarketCandidate(market=market, is_new=seen.mark_new(market_key(market)))
-        for market in markets
-        if is_tradable_market(market)
-    ]
-    candidates.sort(
-        key=lambda candidate: (
-            not candidate.is_new,
-            not has_rewards(candidate.market),
-            -_timestamp_sort_value(_field(candidate.market, "accepting_order_timestamp")),
-            _market_slug(candidate.market),
-        )
+    return _select_candidates(
+        markets,
+        max_markets,
+        is_new=lambda market: seen.mark_new(market_key(market)),
     )
-    return candidates[:max_markets]
 
 
 def select_event_candidates(
     markets: list[dict[str, Any]],
     max_markets: int,
 ) -> list[MarketCandidate]:
+    return _select_candidates(markets, max_markets, is_new=lambda _: False)
+
+
+def _select_candidates(
+    markets: list[dict[str, Any]],
+    max_markets: int,
+    is_new: Callable[[dict[str, Any]], bool],
+) -> list[MarketCandidate]:
     candidates = [
-        MarketCandidate(market=market, is_new=False)
+        MarketCandidate(market=market, is_new=is_new(market))
         for market in markets
         if is_tradable_market(market)
     ]
@@ -193,9 +192,9 @@ def has_rewards(market: dict[str, Any]) -> bool:
 
 
 def market_key(market: dict[str, Any]) -> str:
-    condition_id = _field(market, "condition_id", "conditionId", "conditionID", "c")
+    condition_id = condition_id_from_market(market)
     if condition_id:
-        return str(condition_id)
+        return condition_id
     return _market_slug(market)
 
 
