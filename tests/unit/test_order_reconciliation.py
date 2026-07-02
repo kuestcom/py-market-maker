@@ -1,14 +1,20 @@
 from decimal import Decimal
 
+from py_clob_client.clob_types import OrderBookSummary, OrderSummary
+
 from py_market_maker import bot
 from py_market_maker.bot import (
     InventoryBuyRoom,
     LiveMarketState,
     LiveTokenState,
+    PreflightRiskAuditResult,
     QuoteBand,
     QuotePlan,
+    TokenQuote,
     post_quote_plan,
     inventory_adjusted_buy_size,
+    preflight_risk_audit,
+    preflight_stale_data_reason,
     stale_input_reason,
 )
 from py_market_maker.config import parse_args
@@ -148,6 +154,32 @@ def test_stale_input_reason_flags_data_older_than_threshold():
 
 def test_stale_input_reason_accepts_fresh_data():
     assert stale_input_reason("order book", 100.0, 109.0, 10.0) is None
+
+
+def test_preflight_stale_data_reason_flags_stale_token_inputs():
+    now = 100.0
+    token_quotes = [
+        TokenQuote(
+            token_id="yes",
+            outcome="Yes",
+            fair_price=Decimal("0.50"),
+            book_fetched_at=now,
+            plan=None,
+            skip_reason=None,
+        )
+    ]
+    market_state = _market_state(now=now)
+    market_state.token_state("yes").open_orders_fetched_at = now - 11
+
+    reason = preflight_stale_data_reason(
+        token_quotes,
+        market_state,
+        now,
+        parse_args(["--max-data-age-secs", "10"]),
+    )
+
+    assert reason is not None
+    assert "token yes open orders" in reason
 
 
 def test_inventory_adjusted_buy_size_caps_to_remaining_room():
@@ -411,17 +443,90 @@ def test_active_pause_skips_posting_orders(tmp_path):
     assert market_state.pending_orders == []
 
 
+def test_preflight_risk_audit_cancels_and_pauses_on_market_breach(tmp_path):
+    pause_path = tmp_path / "paused.json"
+    open_buy = _open_order("open-buy", BUY, "0.49", "5")
+    client = FakeClient(
+        books={"yes": _book()},
+        balances={"yes": Decimal("11")},
+        open_order_pages={"yes": [[open_buy]]},
+    )
+
+    result = preflight_risk_audit(
+        client,
+        client,
+        [_market()],
+        parse_args([
+            "--live",
+            "--private-key",
+            "0xabc",
+            "--deposit-wallet",
+            "0xdef",
+            "--chain-id",
+            "137",
+            "--cancel-on-risk-breach",
+            "--pause-on-risk-breach",
+            "--pause-path",
+            str(pause_path),
+            "--max-inventory-per-token",
+            "10",
+        ]),
+    )
+
+    pause = PauseState.load(pause_path)
+    assert result == PreflightRiskAuditResult.STOP
+    assert client.cancel_batches == [["open-buy"]]
+    assert pause is not None
+    assert pause.reason == "preflight risk breach market: token yes inventory 16 exceeds limit 10"
+
+
+def test_preflight_risk_audit_skips_cycle_on_breach_without_pause():
+    client = FakeClient(
+        books={"yes": _book()},
+        balances={"yes": Decimal("11")},
+    )
+
+    result = preflight_risk_audit(
+        client,
+        client,
+        [_market()],
+        parse_args([
+            "--live",
+            "--private-key",
+            "0xabc",
+            "--deposit-wallet",
+            "0xdef",
+            "--chain-id",
+            "137",
+            "--max-inventory-per-token",
+            "10",
+        ]),
+    )
+
+    assert result == PreflightRiskAuditResult.SKIP_CYCLE
+    assert client.cancel_batches == []
+
+
 class FakeClient:
-    def __init__(self, open_order_pages=None, post_responses=None):
+    def __init__(self, open_order_pages=None, post_responses=None, books=None, balances=None):
         self.open_order_pages = {
             token_id: list(pages)
             for token_id, pages in (open_order_pages or {}).items()
         }
         self.post_responses = list(post_responses or [])
+        self.books = dict(books or {})
+        self.balances = dict(balances or {})
         self.cancel_batches = []
         self.created_orders = []
         self.posted_orders = []
         self.get_order_tokens = []
+
+    def get_order_book(self, token_id):
+        return self.books[token_id]
+
+    def get_balance_allowance(self, params):
+        balance = self.balances.get(params.token_id, Decimal("0"))
+        return {"balance": str(balance * bot.CONDITIONAL_TOKEN_BASE_UNITS)}
 
     def cancel_orders(self, order_ids):
         self.cancel_batches.append(list(order_ids))
@@ -525,3 +630,24 @@ def _post_response(success, order_id):
         "orderID": order_id,
         "status": "live" if success else "rejected",
     }
+
+
+def _market():
+    return {
+        "slug": "market",
+        "question": "Question?",
+        "enable_order_book": True,
+        "active": True,
+        "closed": False,
+        "archived": False,
+        "accepting_orders": True,
+        "tokens": [{"token_id": "yes", "outcome": "Yes", "price": "0.50"}],
+    }
+
+
+def _book():
+    return OrderBookSummary(
+        bids=[OrderSummary(price="0.49", size="10")],
+        asks=[OrderSummary(price="0.51", size="10")],
+        tick_size="0.01",
+    )

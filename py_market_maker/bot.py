@@ -99,9 +99,17 @@ class QuoteBand:
 @dataclass(frozen=True)
 class TokenQuote:
     token_id: str
+    outcome: str
     fair_price: Decimal
+    book_fetched_at: float
     plan: QuotePlan | None
     skip_reason: str | None
+
+
+class PreflightRiskAuditResult(str, Enum):
+    CONTINUE = "continue"
+    SKIP_CYCLE = "skip_cycle"
+    STOP = "stop"
 
 
 @dataclass(frozen=True)
@@ -441,6 +449,20 @@ def run_cycles(
         if config.discover_only:
             continue
 
+        if live_client is not None:
+            preflight = preflight_risk_audit(
+                public_client,
+                live_client,
+                [candidate.market for candidate in candidates],
+                config,
+            )
+            if preflight == PreflightRiskAuditResult.SKIP_CYCLE:
+                if cycle < config.cycles:
+                    time.sleep(config.refresh_secs)
+                continue
+            if preflight == PreflightRiskAuditResult.STOP:
+                return
+
         for candidate in candidates:
             quote_market(public_client, live_client, candidate.market, config)
             if stop_if_paused(config):
@@ -614,19 +636,11 @@ def quote_market(
     market: dict[str, Any],
     config: Config,
 ) -> None:
-    token_quotes: list[TokenQuote] = []
-    for token in _market_tokens(market):
-        token_id = _token_id(token)
-        if not token_id:
-            continue
-
-        book = public_client.get_order_book(token_id)
-        book_fetched_at = time.monotonic()
-        token_quote = build_token_quote(market, token, book, book_fetched_at, config)
-        token_quotes.append(token_quote)
+    token_quotes = build_market_token_quotes(public_client, market, config)
+    for token_quote in token_quotes:
         if token_quote.plan is None:
             reason = token_quote.skip_reason or "no safe quote at configured edge/sides"
-            print(f"skip {_market_slug(market)} {_token_outcome(token)}: {reason}")
+            print(f"skip {_market_slug(market)} {token_quote.outcome}: {reason}")
             continue
 
         print_plan(token_quote.plan, config.live)
@@ -642,6 +656,72 @@ def quote_market(
             post_quote_plan(live_client, token_quote.plan, config, market_state)
             if stop_if_paused(config):
                 return
+
+
+def preflight_risk_audit(
+    public_client: ClobClient,
+    live_client: ClobClient,
+    markets: list[dict[str, Any]],
+    config: Config,
+) -> PreflightRiskAuditResult:
+    if not markets:
+        return PreflightRiskAuditResult.CONTINUE
+
+    print(f"preflight risk audit: checking {len(markets)} markets")
+    for market in markets:
+        pause = PauseState.load(config.pause_path)
+        if pause is not None:
+            print(f"preflight risk audit stopped by {config.pause_path}: {pause.reason.strip()}")
+            return PreflightRiskAuditResult.STOP
+
+        try:
+            token_quotes = build_market_token_quotes(public_client, market, config)
+        except Exception as error:
+            print(f"preflight risk audit skip {_market_slug(market)}: failed to fetch order books ({error})")
+            return PreflightRiskAuditResult.SKIP_CYCLE
+
+        try:
+            market_state = LiveMarketState.load(live_client, token_quotes)
+        except Exception as error:
+            print(f"preflight risk audit skip {_market_slug(market)}: failed to fetch live state ({error})")
+            return PreflightRiskAuditResult.SKIP_CYCLE
+
+        stale_reason = preflight_stale_data_reason(token_quotes, market_state, time.monotonic(), config)
+        if stale_reason is not None:
+            print(f"preflight risk audit skip {_market_slug(market)}: stale live data ({stale_reason})")
+            return PreflightRiskAuditResult.SKIP_CYCLE
+
+        breaches = market_state.risk_breaches(config)
+        if breaches:
+            print_preflight_risk_breaches(market, breaches)
+            if config.cancel_on_risk_breach:
+                cancel_risk_increasing_market_orders(live_client, market, config, market_state)
+            if config.pause_on_risk_breach:
+                reason = preflight_breach_pause_reason(market, breaches)
+                PauseState.save_reason(config.pause_path, reason)
+                print(f"wrote pause file {config.pause_path}: {reason}")
+                return PreflightRiskAuditResult.STOP
+            return PreflightRiskAuditResult.SKIP_CYCLE
+
+    return PreflightRiskAuditResult.CONTINUE
+
+
+def build_market_token_quotes(
+    public_client: ClobClient,
+    market: dict[str, Any],
+    config: Config,
+) -> list[TokenQuote]:
+    token_quotes: list[TokenQuote] = []
+    for token in _market_tokens(market):
+        token_id = _token_id(token)
+        if not token_id:
+            continue
+
+        book = public_client.get_order_book(token_id)
+        book_fetched_at = time.monotonic()
+        token_quotes.append(build_token_quote(market, token, book, book_fetched_at, config))
+
+    return token_quotes
 
 
 def build_token_quote(
@@ -660,7 +740,9 @@ def build_token_quote(
     plan = None if liquidity_skip else build_quote_plan(market, token, book, book_fetched_at, quote_inputs, config)
     return TokenQuote(
         token_id=_token_id(token),
+        outcome=_token_outcome(token),
         fair_price=quote_inputs.fair_price,
+        book_fetched_at=book_fetched_at,
         plan=plan,
         skip_reason=liquidity_skip if plan is None else None,
     )
@@ -1081,9 +1163,19 @@ def print_risk_breaches(plan: QuotePlan, breaches: list[RiskBreach]) -> None:
         print(f"risk breach {plan.market_slug} {plan.outcome}: {breach.message()}")
 
 
+def print_preflight_risk_breaches(market: dict[str, Any], breaches: list[RiskBreach]) -> None:
+    for breach in breaches:
+        print(f"preflight risk breach {_market_slug(market)}: {breach.message()}")
+
+
 def risk_breach_pause_reason(plan: QuotePlan, breaches: list[RiskBreach]) -> str:
     messages = "; ".join(breach.message() for breach in breaches)
     return f"risk breach {plan.market_slug} {plan.outcome}: {messages}"
+
+
+def preflight_breach_pause_reason(market: dict[str, Any], breaches: list[RiskBreach]) -> str:
+    messages = "; ".join(breach.message() for breach in breaches)
+    return f"preflight risk breach {_market_slug(market)}: {messages}"
 
 
 def risk_breach_applies_to_token(breaches: list[RiskBreach], token_id: str) -> bool:
@@ -1122,12 +1214,55 @@ def cancel_risk_increasing_orders(
     return open_orders_for_token(client, plan.token_id)
 
 
+def cancel_risk_increasing_market_orders(
+    client: ClobClient,
+    market: dict[str, Any],
+    config: Config,
+    market_state: LiveMarketState,
+) -> None:
+    order_ids = [
+        order_id
+        for token_state in market_state.tokens
+        for order in token_state.open_orders
+        if _response_field(order, "side") == BUY
+        for order_id in [open_order_id(order)]
+        if order_id
+    ]
+    if not order_ids:
+        return
+
+    canceled_count = 0
+    not_canceled_count = 0
+    for batch in batched(order_ids, CANCEL_ORDER_BATCH_SIZE):
+        if skip_market_live_action_if_paused(market, config, "canceling preflight risk-increasing orders"):
+            return
+        response = client.cancel_orders(batch)
+        canceled_count += len(_response_list(response, "canceled"))
+        not_canceled_count += len(_response_list(response, "not_canceled"))
+
+    print(
+        f"preflight risk cancel {_market_slug(market)}: "
+        f"canceled={canceled_count} not_canceled={not_canceled_count}"
+    )
+
+
 def skip_live_action_if_paused(plan: QuotePlan, config: Config, action: str) -> bool:
     pause = PauseState.load(config.pause_path)
     if pause is None:
         return False
     print(
         f"skip {action} for {plan.market_slug} {plan.outcome}: "
+        f"pause active at {config.pause_path} ({pause.reason.strip()})"
+    )
+    return True
+
+
+def skip_market_live_action_if_paused(market: dict[str, Any], config: Config, action: str) -> bool:
+    pause = PauseState.load(config.pause_path)
+    if pause is None:
+        return False
+    print(
+        f"skip {action} for {_market_slug(market)}: "
         f"pause active at {config.pause_path} ({pause.reason.strip()})"
     )
     return True
@@ -1359,6 +1494,27 @@ def stale_live_data_reason(
         or stale_input_reason("open orders", token_state.open_orders_fetched_at, now, max_age_secs)
         or stale_input_reason("token balance", token_state.balance_fetched_at, now, max_age_secs)
     )
+
+
+def preflight_stale_data_reason(
+    token_quotes: list[TokenQuote],
+    market_state: LiveMarketState,
+    now: float,
+    config: Config,
+) -> str | None:
+    max_age_secs = float(config.max_data_age_secs)
+    for token_quote in token_quotes:
+        token_state = market_state.token_state(token_quote.token_id)
+        if token_state is None:
+            return f"missing live state for token {token_quote.token_id}"
+        reason = (
+            stale_input_reason("order book", token_quote.book_fetched_at, now, max_age_secs)
+            or stale_input_reason("open orders", token_state.open_orders_fetched_at, now, max_age_secs)
+            or stale_input_reason("token balance", token_state.balance_fetched_at, now, max_age_secs)
+        )
+        if reason is not None:
+            return f"token {token_quote.token_id} {reason}"
+    return None
 
 
 def stale_input_reason(
