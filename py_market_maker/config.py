@@ -50,6 +50,8 @@ class Config:
     band_avg_size: Decimal | None
     band_max_size: Decimal | None
     max_loss_per_market: Decimal
+    max_inventory_per_token: Decimal
+    max_inventory_per_market: Decimal
     max_book_spread_ticks: int
     min_top_depth: Decimal
     quote_sides: QuoteSides
@@ -92,6 +94,8 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
         band_avg_size=args.band_avg_size,
         band_max_size=args.band_max_size,
         max_loss_per_market=args.max_loss_per_market,
+        max_inventory_per_token=args.max_inventory_per_token,
+        max_inventory_per_market=args.max_inventory_per_market,
         max_book_spread_ticks=args.max_book_spread_ticks,
         min_top_depth=args.min_top_depth,
         quote_sides=QuoteSides(args.quote_sides),
@@ -203,6 +207,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=_env_decimal("MARKET_MAKER_MAX_LOSS_PER_MARKET", Decimal("25")),
     )
     parser.add_argument(
+        "--max-inventory-per-token",
+        type=_parse_decimal,
+        default=_env_decimal("MARKET_MAKER_MAX_INVENTORY_PER_TOKEN", Decimal("25")),
+    )
+    parser.add_argument(
+        "--max-inventory-per-market",
+        type=_parse_decimal,
+        default=_env_decimal("MARKET_MAKER_MAX_INVENTORY_PER_MARKET", Decimal("50")),
+    )
+    parser.add_argument(
         "--max-book-spread-ticks",
         type=int,
         default=_env_int("MARKET_MAKER_MAX_BOOK_SPREAD_TICKS", 20),
@@ -305,6 +319,10 @@ def validate_config(config: Config, parser: argparse.ArgumentParser) -> None:
         parser.error("MARKET_MAKER_BAND_*_SIZE must satisfy min <= avg <= max")
     if config.max_loss_per_market <= Decimal("0"):
         parser.error("MARKET_MAKER_MAX_LOSS_PER_MARKET must be greater than zero")
+    if config.max_inventory_per_token <= Decimal("0"):
+        parser.error("MARKET_MAKER_MAX_INVENTORY_PER_TOKEN must be greater than zero")
+    if config.max_inventory_per_market <= Decimal("0"):
+        parser.error("MARKET_MAKER_MAX_INVENTORY_PER_MARKET must be greater than zero")
     if config.max_book_spread_ticks <= 0:
         parser.error("MARKET_MAKER_MAX_BOOK_SPREAD_TICKS must be greater than zero")
     if config.min_top_depth < Decimal("0"):

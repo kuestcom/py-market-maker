@@ -74,6 +74,7 @@ class QuoteBand:
     price: Decimal
     min_price: Decimal
     max_price: Decimal
+    minimum_size: Decimal
     min_size: Decimal
     avg_size: Decimal
     max_size: Decimal
@@ -115,6 +116,13 @@ class SubmittedOrder:
     side: str
     proposed_order: ProposedOrder
     order: Any
+
+
+@dataclass(frozen=True)
+class InventoryBuyRoom:
+    token_position: Decimal
+    market_inventory: Decimal
+    room: Decimal
 
 
 class LiquidityRejectKind(str, Enum):
@@ -248,6 +256,53 @@ class LiveMarketState:
                 for open_order in refreshed_open_orders
             )
         ]
+
+    def inventory_buy_room(
+        self,
+        token_id: str,
+        staged_orders: list[ProposedOrder],
+        config: Config,
+    ) -> InventoryBuyRoom:
+        token_position = self.long_inventory_for_token(token_id, staged_orders)
+        market_inventory = self.long_market_inventory(staged_orders)
+        token_room = max(config.max_inventory_per_token - token_position, Decimal("0"))
+        market_room = max(config.max_inventory_per_market - market_inventory, Decimal("0"))
+        return InventoryBuyRoom(
+            token_position=token_position,
+            market_inventory=market_inventory,
+            room=min(token_room, market_room),
+        )
+
+    def long_inventory_for_token(
+        self,
+        token_id: str,
+        staged_orders: list[ProposedOrder],
+    ) -> Decimal:
+        token = self.token_state(token_id)
+        if token is None:
+            return Decimal("0")
+        return token_long_inventory(
+            token.balance,
+            token.open_orders,
+            self.pending_orders,
+            staged_orders,
+            token_id,
+        )
+
+    def long_market_inventory(self, staged_orders: list[ProposedOrder]) -> Decimal:
+        return sum(
+            (
+                token_long_inventory(
+                    token.balance,
+                    token.open_orders,
+                    self.pending_orders,
+                    staged_orders,
+                    token.token_id,
+                )
+                for token in self.tokens
+            ),
+            Decimal("0"),
+        )
 
 
 class ShutdownRequested(Exception):
@@ -628,6 +683,7 @@ def build_quote_band(
         price=price,
         min_price=min_price,
         max_price=max_price,
+        minimum_size=order_size(market, Decimal("0"), config),
         min_size=order_size(market, min_size, config),
         avg_size=order_size(market, avg_size, config),
         max_size=order_size(market, max_size, config),
@@ -776,13 +832,32 @@ def post_quote_plan(
         if missing_size is None:
             continue
 
+        staged_orders = [planned_order.proposed_order for planned_order in planned_orders]
+        if band.side == BUY:
+            inventory_room = market_state.inventory_buy_room(plan.token_id, staged_orders, config)
+            adjusted_size = inventory_adjusted_buy_size(missing_size, band.minimum_size, inventory_room.room)
+            if adjusted_size is None:
+                print(
+                    f"skip {plan.market_slug} {plan.outcome} buy: "
+                    f"inventory room {inventory_room.room} below minimum order size {band.minimum_size} "
+                    f"(token position {inventory_room.token_position}, "
+                    f"market inventory {inventory_room.market_inventory})"
+                )
+                continue
+            if adjusted_size < missing_size:
+                print(
+                    f"cap {plan.market_slug} {plan.outcome} buy size from {missing_size} to {adjusted_size}: "
+                    f"token position {inventory_room.token_position} / max {config.max_inventory_per_token}, "
+                    f"market inventory {inventory_room.market_inventory} / max {config.max_inventory_per_market}"
+                )
+            missing_size = adjusted_size
+
         proposed = ProposedOrder(
             token_id=plan.token_id,
             side=band.side,
             price=band.price,
             size=missing_size,
         )
-        staged_orders = [planned_order.proposed_order for planned_order in planned_orders]
         if market_loss_exceeds_cap(plan, proposed, market_state, config, staged_orders):
             continue
         order = client.create_order(
@@ -859,6 +934,50 @@ def band_missing_size(band: QuoteBand, open_size: Decimal) -> Decimal | None:
     if open_size >= band.min_size:
         return None
     return max(band.avg_size - open_size, Decimal("0"))
+
+
+def inventory_adjusted_buy_size(
+    requested_size: Decimal,
+    minimum_size: Decimal,
+    inventory_room: Decimal,
+) -> Decimal | None:
+    size = min(requested_size, inventory_room)
+    if size <= Decimal("0") or size < minimum_size:
+        return None
+    return size
+
+
+def token_long_inventory(
+    balance: Decimal,
+    open_orders: list[Any],
+    pending_orders: list[ProposedOrder],
+    staged_orders: list[ProposedOrder],
+    token_id: str,
+) -> Decimal:
+    return (
+        max(balance, Decimal("0"))
+        + buy_order_size_for_token(open_orders, token_id)
+        + pending_buy_size_for_token(pending_orders, token_id)
+        + pending_buy_size_for_token(staged_orders, token_id)
+    )
+
+
+def buy_order_size_for_token(orders: list[Any], token_id: str) -> Decimal:
+    return sum(
+        (
+            open_order_remaining_size(order)
+            for order in orders
+            if open_order_token_id(order, token_id) == token_id and _response_field(order, "side") == BUY
+        ),
+        Decimal("0"),
+    )
+
+
+def pending_buy_size_for_token(orders: list[ProposedOrder], token_id: str) -> Decimal:
+    return sum(
+        (order.size for order in orders if order.token_id == token_id and order.side == BUY),
+        Decimal("0"),
+    )
 
 
 def market_loss_exceeds_cap(
@@ -1029,6 +1148,11 @@ def open_order_remaining_size(order: Any) -> Decimal:
 def open_order_id(order: Any) -> str:
     value = _response_field(order, "id", "order_id", "orderID")
     return str(value) if value is not None else ""
+
+
+def open_order_token_id(order: Any, default_token_id: str) -> str:
+    value = _response_field(order, "asset_id", "token_id", "tokenId", "assetId")
+    return str(value) if value is not None else default_token_id
 
 
 def response_item_id(item: Any) -> str:
