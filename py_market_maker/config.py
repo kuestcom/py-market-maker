@@ -52,6 +52,7 @@ class Config:
     cycles: int
     refresh_secs: int
     state_path: Path
+    event_slug: str | None = None
 
 
 def parse_args(argv: Sequence[str] | None = None) -> Config:
@@ -65,6 +66,7 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
         deposit_wallet=args.deposit_wallet,
         chain_id=args.chain_id,
         discovery=DiscoveryMode(args.discovery),
+        event_slug=args.event_slug,
         max_markets=args.max_markets,
         max_pages=args.max_pages,
         order_size=args.order_size,
@@ -113,6 +115,7 @@ def build_parser() -> argparse.ArgumentParser:
             [mode.value for mode in DiscoveryMode],
         ),
     )
+    parser.add_argument("--event-slug", default=_env_optional_str("MARKET_MAKER_EVENT_SLUG"))
     parser.add_argument(
         "--max-markets",
         type=int,
@@ -197,6 +200,8 @@ def validate_config(config: Config, parser: argparse.ArgumentParser) -> None:
         parser.error("MARKET_MAKER_EDGE_TICKS must be greater than zero")
     if config.min_spread_ticks <= 0:
         parser.error("MARKET_MAKER_MIN_SPREAD_TICKS must be greater than zero")
+    if config.event_slug is not None and not config.event_slug.strip():
+        parser.error("MARKET_MAKER_EVENT_SLUG cannot be empty")
     if config.cycles <= 0:
         parser.error("MARKET_MAKER_CYCLES must be greater than zero")
     if config.live:
