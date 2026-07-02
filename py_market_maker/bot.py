@@ -60,6 +60,7 @@ class QuotePlan:
     fair_price: Decimal
     best_bid: Decimal | None
     best_ask: Decimal | None
+    book_fetched_at: float
     buy_band: QuoteBand | None
     sell_band: QuoteBand | None
 
@@ -151,7 +152,9 @@ class LiveTokenState:
     token_id: str
     fair_price: Decimal
     balance: Decimal
+    balance_fetched_at: float
     open_orders: list[Any]
+    open_orders_fetched_at: float
 
 
 @dataclass
@@ -161,18 +164,23 @@ class LiveMarketState:
 
     @classmethod
     def load(cls, client: ClobClient, token_quotes: list[TokenQuote]) -> "LiveMarketState":
-        return cls(
-            tokens=[
+        tokens = []
+        for token_quote in token_quotes:
+            balance = conditional_balance(client, token_quote.token_id)
+            balance_fetched_at = time.monotonic()
+            open_orders = open_orders_for_token(client, token_quote.token_id)
+            open_orders_fetched_at = time.monotonic()
+            tokens.append(
                 LiveTokenState(
                     token_id=token_quote.token_id,
                     fair_price=token_quote.fair_price,
-                    balance=conditional_balance(client, token_quote.token_id),
-                    open_orders=open_orders_for_token(client, token_quote.token_id),
+                    balance=balance,
+                    balance_fetched_at=balance_fetched_at,
+                    open_orders=open_orders,
+                    open_orders_fetched_at=open_orders_fetched_at,
                 )
-                for token_quote in token_quotes
-            ],
-            pending_orders=[],
-        )
+            )
+        return cls(tokens=tokens, pending_orders=[])
 
     def exposure(self) -> MarketExposure:
         exposure = MarketExposure(
@@ -198,10 +206,14 @@ class LiveMarketState:
         self.pending_orders.append(order)
 
     def open_orders(self, token_id: str) -> list[Any]:
+        token = self.token_state(token_id)
+        return list(token.open_orders) if token is not None else []
+
+    def token_state(self, token_id: str) -> LiveTokenState | None:
         for token in self.tokens:
             if token.token_id == token_id:
-                return list(token.open_orders)
-        return []
+                return token
+        return None
 
     def remove_open_orders(self, token_id: str, order_ids: set[str]) -> None:
         if not order_ids:
@@ -213,10 +225,16 @@ class LiveMarketState:
                 ]
                 return
 
-    def replace_open_orders(self, token_id: str, open_orders: list[Any]) -> None:
+    def replace_open_orders(
+        self,
+        token_id: str,
+        open_orders: list[Any],
+        fetched_at: float | None = None,
+    ) -> None:
         for token in self.tokens:
             if token.token_id == token_id:
                 token.open_orders = list(open_orders)
+                token.open_orders_fetched_at = time.monotonic() if fetched_at is None else fetched_at
                 return
 
     def remove_pending_orders_now_open(self, refreshed_open_orders: list[Any]) -> None:
@@ -474,7 +492,8 @@ def quote_market(
             continue
 
         book = public_client.get_order_book(token_id)
-        token_quote = build_token_quote(market, token, book, config)
+        book_fetched_at = time.monotonic()
+        token_quote = build_token_quote(market, token, book, book_fetched_at, config)
         token_quotes.append(token_quote)
         if token_quote.plan is None:
             reason = token_quote.skip_reason or "no safe quote at configured edge/sides"
@@ -496,6 +515,7 @@ def build_token_quote(
     market: dict[str, Any],
     token: dict[str, Any],
     book: OrderBookSummary,
+    book_fetched_at: float,
     config: Config,
 ) -> TokenQuote:
     quote_inputs = build_quote_inputs(token, book)
@@ -504,7 +524,7 @@ def build_token_quote(
         reject_reason = liquidity_quality_reject_reason(book, config)
         if reject_reason is not None:
             liquidity_skip = f"liquidity quality check failed: {reject_reason.message()}"
-    plan = None if liquidity_skip else build_quote_plan(market, token, book, quote_inputs, config)
+    plan = None if liquidity_skip else build_quote_plan(market, token, book, book_fetched_at, quote_inputs, config)
     return TokenQuote(
         token_id=_token_id(token),
         fair_price=quote_inputs.fair_price,
@@ -532,6 +552,7 @@ def build_quote_plan(
     market: dict[str, Any],
     token: dict[str, Any],
     book: OrderBookSummary,
+    book_fetched_at: float,
     quote_inputs: QuoteInputs,
     config: Config,
 ) -> QuotePlan | None:
@@ -560,6 +581,7 @@ def build_quote_plan(
         fair_price=quote_inputs.fair_price,
         best_bid=quote_inputs.best_bid,
         best_ask=quote_inputs.best_ask,
+        book_fetched_at=book_fetched_at,
         buy_band=buy_band,
         sell_band=sell_band,
     )
@@ -736,6 +758,11 @@ def post_quote_plan(
             if any(open_order_id(order) in canceled_ids for order in open_orders):
                 print(f"skip placing {plan.market_slug} {plan.outcome}: canceled order state is still unstable")
                 return
+
+    stale_reason = stale_live_data_reason(plan, market_state, time.monotonic(), config)
+    if stale_reason is not None:
+        print(f"skip placing {plan.market_slug} {plan.outcome}: stale live data ({stale_reason})")
+        return
 
     planned_orders: list[SubmittedOrder] = []
     for band in plan.bands():
@@ -1033,6 +1060,35 @@ def apply_post_response(
 
     market_state.record_pending_order(submitted_order.proposed_order)
     return False
+
+
+def stale_live_data_reason(
+    plan: QuotePlan,
+    market_state: LiveMarketState,
+    now: float,
+    config: Config,
+) -> str | None:
+    max_age_secs = float(config.max_data_age_secs)
+    token_state = market_state.token_state(plan.token_id)
+    if token_state is None:
+        return f"missing live state for token {plan.token_id}"
+    return (
+        stale_input_reason("order book", plan.book_fetched_at, now, max_age_secs)
+        or stale_input_reason("open orders", token_state.open_orders_fetched_at, now, max_age_secs)
+        or stale_input_reason("token balance", token_state.balance_fetched_at, now, max_age_secs)
+    )
+
+
+def stale_input_reason(
+    input_name: str,
+    fetched_at: float,
+    now: float,
+    max_age_secs: float,
+) -> str | None:
+    age = max(now - fetched_at, 0.0)
+    if age <= max_age_secs:
+        return None
+    return f"{input_name} age {int(age * 1000)}ms exceeds max {int(max_age_secs * 1000)}ms"
 
 
 def open_order_matches_proposed(order: Any, proposed_order: ProposedOrder) -> bool:

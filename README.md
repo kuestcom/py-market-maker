@@ -78,7 +78,8 @@ exceed the configured market loss cap. By default, live mode also requires a
 two-sided book with acceptable spread and top-of-book depth before quoting.
 After cancel requests, live mode refreshes open orders before posting
 replacements; after post responses, it only counts accepted orders as pending
-local exposure.
+local exposure. It also skips live posts when order books, token balances, or
+open orders are older than the configured data-age limit.
 
 By default live mode only posts buy orders.
 
@@ -199,6 +200,10 @@ emergency cancel target.
   --require-two-sided-live / MARKET_MAKER_REQUIRE_TWO_SIDED_LIVE
   Default: true.
   In live mode, require a valid two-sided book before quoting.
+
+  --max-data-age-secs / MARKET_MAKER_MAX_DATA_AGE_SECS
+  Default: 10.
+  Live-mode freshness limit for order books, token balances, and open orders.
 
   --quote-sides / MARKET_MAKER_QUOTE_SIDES
   Default: buy. Values: buy, sell, both.

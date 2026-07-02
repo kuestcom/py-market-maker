@@ -88,6 +88,7 @@ def test_live_token_quote_records_liquidity_skip_reason():
             asks=[level("0.70", "10")],
             tick_size="0.01",
         ),
+        100.0,
         parse_args(_live_args()),
     )
 
@@ -100,6 +101,7 @@ def test_disabled_live_liquidity_guard_allows_one_sided_fallback_quote():
         _market(),
         _token(),
         OrderBookSummary(bids=[level("0.49", "10")], asks=[], tick_size="0.01"),
+        100.0,
         parse_args([*_live_args(), "--no-require-two-sided-live"]),
     )
 

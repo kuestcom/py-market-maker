@@ -106,6 +106,14 @@ def test_cancel_modes_are_mutually_exclusive(capsys):
     assert "MARKET_MAKER_CANCEL_ALL and MARKET_MAKER_CANCEL_ALL_ON_EXIT are mutually exclusive" in captured.err
 
 
+def test_zero_max_data_age_is_rejected(capsys):
+    with pytest.raises(SystemExit):
+        parse_args(["--max-data-age-secs", "0"])
+
+    captured = capsys.readouterr()
+    assert "MARKET_MAKER_MAX_DATA_AGE_SECS must be greater than zero" in captured.err
+
+
 def _live_args():
     return [
         "--live",

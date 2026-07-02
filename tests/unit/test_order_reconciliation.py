@@ -1,11 +1,13 @@
 from decimal import Decimal
 
+from py_market_maker import bot
 from py_market_maker.bot import (
     LiveMarketState,
     LiveTokenState,
     QuoteBand,
     QuotePlan,
     post_quote_plan,
+    stale_input_reason,
 )
 from py_market_maker.config import parse_args
 from py_market_maker.market_loss import BUY, SELL, ProposedOrder
@@ -88,6 +90,35 @@ def test_failed_batch_response_dedupes_partially_filled_pending_order_now_open()
     assert market_state.open_orders("yes") == [posted_buy]
 
 
+def test_stale_book_skips_live_post(monkeypatch):
+    now = 100.0
+    monkeypatch.setattr(bot.time, "monotonic", lambda: now)
+    market_state = _market_state(now=now)
+    client = FakeClient(post_responses=[_post_response(True, "posted")])
+
+    post_quote_plan(
+        client,
+        _plan(buy_band=_buy_band(), book_fetched_at=now - 11),
+        parse_args(["--max-data-age-secs", "10"]),
+        market_state,
+    )
+
+    assert client.created_orders == []
+    assert client.posted_orders == []
+    assert market_state.pending_orders == []
+
+
+def test_stale_input_reason_flags_data_older_than_threshold():
+    reason = stale_input_reason("order book", 100.0, 111.0, 10.0)
+
+    assert reason is not None
+    assert "order book" in reason
+
+
+def test_stale_input_reason_accepts_fresh_data():
+    assert stale_input_reason("order book", 100.0, 109.0, 10.0) is None
+
+
 class FakeClient:
     def __init__(self, open_order_pages=None, post_responses=None):
         self.open_order_pages = {
@@ -124,22 +155,26 @@ class FakeClient:
         return self.post_responses.pop(0)
 
 
-def _market_state(open_orders=None, balance=Decimal("0")):
+def _market_state(open_orders=None, balance=Decimal("0"), now=None):
+    now = bot.time.monotonic() if now is None else now
     return LiveMarketState(
         tokens=[
             LiveTokenState(
                 token_id="yes",
                 fair_price=Decimal("0.50"),
                 balance=balance,
+                balance_fetched_at=now,
                 open_orders=list(open_orders or []),
+                open_orders_fetched_at=now,
             ),
-            LiveTokenState("no", Decimal("0.50"), Decimal("0"), []),
+            LiveTokenState("no", Decimal("0.50"), Decimal("0"), now, [], now),
         ],
         pending_orders=[],
     )
 
 
-def _plan(buy_band=None, sell_band=None):
+def _plan(buy_band=None, sell_band=None, book_fetched_at=None):
+    book_fetched_at = bot.time.monotonic() if book_fetched_at is None else book_fetched_at
     return QuotePlan(
         market_key="market",
         market_slug="market",
@@ -149,6 +184,7 @@ def _plan(buy_band=None, sell_band=None):
         fair_price=Decimal("0.50"),
         best_bid=Decimal("0.49"),
         best_ask=Decimal("0.51"),
+        book_fetched_at=book_fetched_at,
         buy_band=buy_band,
         sell_band=sell_band,
     )
