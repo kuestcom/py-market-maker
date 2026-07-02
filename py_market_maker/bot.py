@@ -109,6 +109,13 @@ class QuoteInputs:
     best_ask: Decimal | None
 
 
+@dataclass(frozen=True)
+class SubmittedOrder:
+    side: str
+    proposed_order: ProposedOrder
+    order: Any
+
+
 class LiquidityRejectKind(str, Enum):
     MISSING_TWO_SIDED_BOOK = "missing_two_sided_book"
     INVALID_TICK = "invalid_tick"
@@ -205,6 +212,24 @@ class LiveMarketState:
                     order for order in token.open_orders if open_order_id(order) not in order_ids
                 ]
                 return
+
+    def replace_open_orders(self, token_id: str, open_orders: list[Any]) -> None:
+        for token in self.tokens:
+            if token.token_id == token_id:
+                token.open_orders = list(open_orders)
+                return
+
+    def remove_pending_orders_now_open(self, refreshed_open_orders: list[Any]) -> None:
+        if not self.pending_orders:
+            return
+        self.pending_orders = [
+            pending_order
+            for pending_order in self.pending_orders
+            if not any(
+                open_order_matches_proposed(open_order, pending_order)
+                for open_order in refreshed_open_orders
+            )
+        ]
 
 
 class ShutdownRequested(Exception):
@@ -701,14 +726,18 @@ def post_quote_plan(
                 f"canceled band orders for {plan.token_id}: "
                 f"requested={len(order_ids)} canceled={len(canceled)} not_canceled={len(not_canceled)}"
             )
-        market_state.remove_open_orders(
-            plan.token_id,
-            {order_id for item in canceled for order_id in [response_item_id(item)] if order_id},
-        )
-        if canceled:
-            open_orders = market_state.open_orders(plan.token_id)
+        if not_canceled:
+            print(f"skip placing {plan.market_slug} {plan.outcome}: some band orders could not be canceled")
+            return
+        if order_ids:
+            canceled_ids = {open_order_id(order) for order in orders_to_cancel if open_order_id(order)}
+            open_orders = open_orders_for_token(client, plan.token_id)
+            market_state.replace_open_orders(plan.token_id, open_orders)
+            if any(open_order_id(order) in canceled_ids for order in open_orders):
+                print(f"skip placing {plan.market_slug} {plan.outcome}: canceled order state is still unstable")
+                return
 
-    responses = []
+    planned_orders: list[SubmittedOrder] = []
     for band in plan.bands():
         open_size = band_open_size(open_orders, band)
         missing_size = band_missing_size(band, open_size)
@@ -721,7 +750,8 @@ def post_quote_plan(
             price=band.price,
             size=missing_size,
         )
-        if market_loss_exceeds_cap(plan, proposed, market_state, config):
+        staged_orders = [planned_order.proposed_order for planned_order in planned_orders]
+        if market_loss_exceeds_cap(plan, proposed, market_state, config, staged_orders):
             continue
         order = client.create_order(
             OrderArgs(
@@ -731,10 +761,14 @@ def post_quote_plan(
                 side=band.side,
             )
         )
-        market_state.record_pending_order(proposed)
-        responses.append((band.side, client.post_order(order, orderType=OrderType.GTC, post_only=config.post_only)))
+        planned_orders.append(SubmittedOrder(side=band.side, proposed_order=proposed, order=order))
 
+    responses = [
+        (planned_order, client.post_order(planned_order.order, orderType=OrderType.GTC, post_only=config.post_only))
+        for planned_order in planned_orders
+    ]
     print_post_responses(plan, responses)
+    apply_post_responses(client, plan, responses, market_state)
 
 
 def cancellable_orders(open_orders: list[Any], plan: QuotePlan) -> list[Any]:
@@ -800,8 +834,12 @@ def market_loss_exceeds_cap(
     proposed_order: ProposedOrder,
     market_state: LiveMarketState,
     config: Config,
+    staged_orders: list[ProposedOrder] | None = None,
 ) -> bool:
-    projected_loss = market_state.exposure().projected_loss(proposed_order)
+    exposure = market_state.exposure()
+    for staged_order in staged_orders or []:
+        exposure.apply_order(staged_order)
+    projected_loss = exposure.projected_loss(proposed_order)
     if projected_loss <= config.max_loss_per_market:
         return False
 
@@ -968,14 +1006,55 @@ def response_item_id(item: Any) -> str:
     return str(value) if value is not None else ""
 
 
+def apply_post_responses(
+    client: ClobClient,
+    plan: QuotePlan,
+    responses: list[tuple[SubmittedOrder, Any]],
+    market_state: LiveMarketState,
+) -> None:
+    has_failed_response = False
+    for submitted_order, response in responses:
+        has_failed_response |= apply_post_response(submitted_order, response, market_state)
+
+    if has_failed_response:
+        refreshed_orders = open_orders_for_token(client, plan.token_id)
+        market_state.remove_pending_orders_now_open(refreshed_orders)
+        market_state.replace_open_orders(plan.token_id, refreshed_orders)
+        print(f"post state refreshed for {plan.market_slug} {plan.outcome} after rejected order response")
+
+
+def apply_post_response(
+    submitted_order: SubmittedOrder,
+    response: Any,
+    market_state: LiveMarketState,
+) -> bool:
+    if not response_success(response):
+        return True
+
+    market_state.record_pending_order(submitted_order.proposed_order)
+    return False
+
+
+def open_order_matches_proposed(order: Any, proposed_order: ProposedOrder) -> bool:
+    token_id = str(_response_field(order, "asset_id", "token_id", "tokenId") or "")
+    side = _response_field(order, "side")
+    price = _decimal_or_none(_response_field(order, "price"))
+    return (
+        token_id == proposed_order.token_id
+        and side == proposed_order.side
+        and price == proposed_order.price
+        and open_order_remaining_size(order) == proposed_order.size
+    )
+
+
 def open_order_created_at(order: Any) -> float:
     return _timestamp_sort_value(_response_field(order, "created_at", "createdAt"))
 
 
-def print_post_responses(plan: QuotePlan, responses: list[tuple[str, Any]]) -> None:
-    for side, response in responses:
+def print_post_responses(plan: QuotePlan, responses: list[tuple[SubmittedOrder, Any]]) -> None:
+    for submitted_order, response in responses:
         print(
-            f"posted {plan.market_slug} {plan.outcome} side={side} "
+            f"posted {plan.market_slug} {plan.outcome} side={submitted_order.side} "
             f"order_id={_response_field(response, 'orderID', 'order_id', 'id')} "
             f"success={_response_field(response, 'success')} "
             f"status={_response_field(response, 'status')} "
@@ -1067,6 +1146,15 @@ def _response_field(response: Any, *names: str) -> Any:
 def _response_list(response: Any, name: str) -> list[Any]:
     value = _response_field(response, name)
     return value if isinstance(value, list) else []
+
+
+def response_success(response: Any) -> bool:
+    value = _response_field(response, "success")
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "y", "on")
+    return bool(value)
 
 
 def _timestamp_sort_value(value: Any) -> float:
