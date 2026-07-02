@@ -93,7 +93,8 @@ def test_failed_batch_response_dedupes_partially_filled_pending_order_now_open()
 def test_stale_book_skips_live_post(monkeypatch):
     now = 100.0
     monkeypatch.setattr(bot.time, "monotonic", lambda: now)
-    market_state = _market_state(now=now)
+    stale_order = _open_order("stale", BUY, "0.46", "5")
+    market_state = _market_state(open_orders=[stale_order], now=now)
     client = FakeClient(post_responses=[_post_response(True, "posted")])
 
     post_quote_plan(
@@ -103,8 +104,10 @@ def test_stale_book_skips_live_post(monkeypatch):
         market_state,
     )
 
+    assert client.cancel_batches == []
     assert client.created_orders == []
     assert client.posted_orders == []
+    assert market_state.open_orders("yes") == [stale_order]
     assert market_state.pending_orders == []
 
 

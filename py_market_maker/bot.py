@@ -737,6 +737,11 @@ def post_quote_plan(
     market_state: LiveMarketState,
 ) -> None:
     open_orders = market_state.open_orders(plan.token_id)
+    stale_reason = stale_live_data_reason(plan, market_state, time.monotonic(), config)
+    if stale_reason is not None:
+        print(f"skip placing {plan.market_slug} {plan.outcome}: stale live data ({stale_reason})")
+        return
+
     if config.cancel_before_quote:
         orders_to_cancel = cancellable_orders(open_orders, plan)
         order_ids = [open_order_id(order) for order in orders_to_cancel if open_order_id(order)]
@@ -758,11 +763,6 @@ def post_quote_plan(
             if any(open_order_id(order) in canceled_ids for order in open_orders):
                 print(f"skip placing {plan.market_slug} {plan.outcome}: canceled order state is still unstable")
                 return
-
-    stale_reason = stale_live_data_reason(plan, market_state, time.monotonic(), config)
-    if stale_reason is not None:
-        print(f"skip placing {plan.market_slug} {plan.outcome}: stale live data ({stale_reason})")
-        return
 
     planned_orders: list[SubmittedOrder] = []
     for band in plan.bands():
