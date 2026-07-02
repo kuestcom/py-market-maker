@@ -323,8 +323,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def validate_config(config: Config, parser: argparse.ArgumentParser) -> None:
-    if str(config.pause_path) == "":
-        parser.error("MARKET_MAKER_PAUSE_PATH cannot be empty")
     if config.clear_pause and (config.cancel_all or config.cancel_all_on_exit):
         parser.error("MARKET_MAKER_CLEAR_PAUSE cannot be combined with cancel-all actions")
     if config.clear_pause:
