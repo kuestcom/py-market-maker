@@ -687,7 +687,7 @@ def quote_market(
         if stop_if_paused(config):
             return
         if token_quote.plan is not None:
-            post_quote_plan(live_client, token_quote.plan, config, market_state)
+            post_quote_plan(live_client, token_quote.plan, config, market_state, public_client)
             if stop_if_paused(config):
                 return
 
@@ -1007,6 +1007,7 @@ def post_quote_plan(
     plan: QuotePlan,
     config: Config,
     market_state: LiveMarketState,
+    public_client: ClobClient | None = None,
 ) -> None:
     open_orders = market_state.open_orders(plan.token_id)
     stale_reason = stale_live_data_reason(plan, market_state, time.monotonic(), config)
@@ -1100,6 +1101,12 @@ def post_quote_plan(
             )
         )
         planned_orders.append(SubmittedOrder(side=band.side, proposed_order=proposed, order=order))
+
+    if planned_orders and public_client is not None:
+        move_reason = pre_post_move_reject_reason(public_client, plan, config)
+        if move_reason is not None:
+            print(f"skip posting {plan.market_slug} {plan.outcome}: pre-post price movement ({move_reason})")
+            return
 
     if planned_orders and skip_live_action_if_paused(plan, config, "posting orders"):
         return
@@ -1487,6 +1494,57 @@ def open_order_remaining_size(order: Any) -> Decimal:
         Decimal("0"),
     )
     return max(original_size - size_matched, Decimal("0"))
+
+
+def pre_post_move_reject_reason(
+    public_client: ClobClient,
+    plan: QuotePlan,
+    config: Config,
+) -> str | None:
+    book = public_client.get_order_book(plan.token_id)
+    liquidity_reason = pre_post_liquidity_reject_reason(book, config)
+    if liquidity_reason is not None:
+        return f"refreshed book liquidity check failed: {liquidity_reason.message()}"
+
+    refreshed_fair = fair_price(
+        best_bid(book.bids or []),
+        best_ask(book.asks or []),
+        plan.fair_price,
+        _decimal_or_none(book.last_trade_price),
+    )
+    return price_move_reject_reason(
+        plan.fair_price,
+        refreshed_fair,
+        _decimal(book.tick_size, Decimal("0")),
+        config.max_pre_post_move_ticks,
+    )
+
+
+def pre_post_liquidity_reject_reason(
+    book: OrderBookSummary,
+    config: Config,
+) -> LiquidityRejectReason | None:
+    if not should_enforce_liquidity_quality(config):
+        return None
+    return liquidity_quality_reject_reason(book, config)
+
+
+def price_move_reject_reason(
+    planned_fair: Decimal,
+    refreshed_fair: Decimal,
+    tick: Decimal,
+    max_move_ticks: int,
+) -> str | None:
+    if tick <= Decimal("0"):
+        return "refreshed book tick size is invalid"
+
+    move_ticks = abs(refreshed_fair - planned_fair) / tick
+    if move_ticks > Decimal(max_move_ticks):
+        return (
+            f"fair moved {move_ticks} ticks from {planned_fair} to {refreshed_fair}; "
+            f"max {max_move_ticks}"
+        )
+    return None
 
 
 def open_order_id(order: Any) -> str:

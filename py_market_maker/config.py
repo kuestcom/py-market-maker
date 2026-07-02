@@ -53,6 +53,7 @@ class Config:
     max_inventory_per_token: Decimal
     max_inventory_per_market: Decimal
     max_book_spread_ticks: int
+    max_pre_post_move_ticks: int
     min_top_depth: Decimal
     quote_sides: QuoteSides
     allow_single_sided: bool
@@ -101,6 +102,7 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
         max_inventory_per_token=args.max_inventory_per_token,
         max_inventory_per_market=args.max_inventory_per_market,
         max_book_spread_ticks=args.max_book_spread_ticks,
+        max_pre_post_move_ticks=args.max_pre_post_move_ticks,
         min_top_depth=args.min_top_depth,
         quote_sides=QuoteSides(args.quote_sides),
         allow_single_sided=args.allow_single_sided,
@@ -230,6 +232,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=_env_int("MARKET_MAKER_MAX_BOOK_SPREAD_TICKS", 20),
     )
     parser.add_argument(
+        "--max-pre-post-move-ticks",
+        type=int,
+        default=_env_int("MARKET_MAKER_MAX_PRE_POST_MOVE_TICKS", 2),
+    )
+    parser.add_argument(
         "--min-top-depth",
         type=_parse_decimal,
         default=_env_decimal("MARKET_MAKER_MIN_TOP_DEPTH", Decimal("5")),
@@ -357,6 +364,8 @@ def validate_config(config: Config, parser: argparse.ArgumentParser) -> None:
         parser.error("MARKET_MAKER_MAX_INVENTORY_PER_MARKET must be greater than zero")
     if config.max_book_spread_ticks <= 0:
         parser.error("MARKET_MAKER_MAX_BOOK_SPREAD_TICKS must be greater than zero")
+    if config.max_pre_post_move_ticks <= 0:
+        parser.error("MARKET_MAKER_MAX_PRE_POST_MOVE_TICKS must be greater than zero")
     if config.min_top_depth < Decimal("0"):
         parser.error("MARKET_MAKER_MIN_TOP_DEPTH cannot be negative")
     if config.event_slug is not None and not config.event_slug.strip():
