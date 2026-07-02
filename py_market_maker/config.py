@@ -74,6 +74,7 @@ class Config:
     state_path: Path
     fill_state_path: Path
     fill_max_records: int
+    position_reconcile_tolerance: Decimal
     event_slug: str | None = None
 
 
@@ -125,6 +126,7 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
         state_path=args.state_path,
         fill_state_path=args.fill_state_path,
         fill_max_records=args.fill_max_records,
+        position_reconcile_tolerance=args.position_reconcile_tolerance,
     )
     validate_config(config, parser)
     return config
@@ -340,6 +342,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=_env_int("MARKET_MAKER_FILL_MAX_RECORDS", 10000),
     )
+    parser.add_argument(
+        "--position-reconcile-tolerance",
+        type=_parse_decimal,
+        default=_env_decimal("MARKET_MAKER_POSITION_RECONCILE_TOLERANCE", Decimal("0.000001")),
+    )
     return parser
 
 
@@ -350,6 +357,8 @@ def validate_config(config: Config, parser: argparse.ArgumentParser) -> None:
         return
     if config.fill_max_records <= 0:
         parser.error("MARKET_MAKER_FILL_MAX_RECORDS must be greater than zero")
+    if config.position_reconcile_tolerance < Decimal("0"):
+        parser.error("MARKET_MAKER_POSITION_RECONCILE_TOLERANCE cannot be negative")
     if config.max_markets <= 0:
         parser.error("MARKET_MAKER_MAX_MARKETS must be greater than zero")
     if config.max_pages <= 0:
