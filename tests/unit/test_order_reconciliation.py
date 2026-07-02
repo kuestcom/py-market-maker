@@ -311,6 +311,36 @@ def test_cancel_on_risk_breach_cancels_open_buys_and_refreshes_state():
     assert market_state.open_orders("yes") == [open_sell]
 
 
+def test_cancel_on_risk_breach_does_not_cancel_unrelated_token_buys():
+    open_buy = _open_order("open-buy", BUY, "0.49", "5")
+    market_state = _market_state(open_orders=[open_buy], no_balance=Decimal("11"))
+    client = FakeClient(post_responses=[_post_response(True, "posted")])
+
+    post_quote_plan(
+        client,
+        _plan(buy_band=_buy_band()),
+        parse_args([
+            "--live",
+            "--private-key",
+            "0xabc",
+            "--deposit-wallet",
+            "0xdef",
+            "--chain-id",
+            "137",
+            "--cancel-on-risk-breach",
+            "--max-inventory-per-token",
+            "10",
+        ]),
+        market_state,
+    )
+
+    assert client.cancel_batches == []
+    assert client.get_order_tokens == []
+    assert client.created_orders == []
+    assert client.posted_orders == []
+    assert market_state.open_orders("yes") == [open_buy]
+
+
 class FakeClient:
     def __init__(self, open_order_pages=None, post_responses=None):
         self.open_order_pages = {

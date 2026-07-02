@@ -881,7 +881,7 @@ def post_quote_plan(
     breaches = market_state.risk_breaches(config)
     if breaches:
         print_risk_breaches(plan, breaches)
-        if config.cancel_on_risk_breach:
+        if config.cancel_on_risk_breach and risk_breach_applies_to_token(breaches, plan.token_id):
             refreshed_orders = cancel_risk_increasing_orders(client, plan, open_orders)
             if refreshed_orders is not None:
                 market_state.replace_open_orders(plan.token_id, refreshed_orders)
@@ -1045,6 +1045,13 @@ def pending_buy_size_for_token(orders: list[ProposedOrder], token_id: str) -> De
 def print_risk_breaches(plan: QuotePlan, breaches: list[RiskBreach]) -> None:
     for breach in breaches:
         print(f"risk breach {plan.market_slug} {plan.outcome}: {breach.message()}")
+
+
+def risk_breach_applies_to_token(breaches: list[RiskBreach], token_id: str) -> bool:
+    return any(
+        breach.kind != "token_inventory" or breach.token_id == token_id
+        for breach in breaches
+    )
 
 
 def cancel_risk_increasing_orders(
