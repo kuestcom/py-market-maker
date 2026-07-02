@@ -28,13 +28,16 @@ class MarketExposure:
     outcomes: list[OutcomeExposure]
 
     def apply_order(self, order: ProposedOrder) -> None:
+        validate_order(order)
         outcome = self._outcome(order.token_id)
         if order.side == BUY:
             outcome.position += order.size
             outcome.cost += order.size * order.price
-        elif order.side == SELL:
+            return
+        if order.side == SELL:
             outcome.position -= order.size
             outcome.proceeds += order.size * order.price
+            return
 
     def worst_loss(self) -> Decimal:
         cost = sum((outcome.cost for outcome in self.outcomes), Decimal("0"))
@@ -67,3 +70,12 @@ class MarketExposure:
             if outcome.token_id == token_id:
                 return outcome
         raise RuntimeError(f"missing exposure state for token {token_id}")
+
+
+def validate_order(order: ProposedOrder) -> None:
+    if order.side not in (BUY, SELL):
+        raise ValueError(f"unsupported order side {order.side}")
+    if order.price <= Decimal("0"):
+        raise ValueError(f"order price must be greater than zero: {order.price}")
+    if order.size <= Decimal("0"):
+        raise ValueError(f"order size must be greater than zero: {order.size}")

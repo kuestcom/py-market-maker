@@ -57,6 +57,13 @@ class TokenQuote:
     plan: QuotePlan | None
 
 
+@dataclass(frozen=True)
+class QuoteInputs:
+    fair_price: Decimal
+    best_bid: Decimal | None
+    best_ask: Decimal | None
+
+
 @dataclass
 class LiveTokenState:
     token_id: str
@@ -313,18 +320,26 @@ def build_token_quote(
     book: OrderBookSummary,
     config: Config,
 ) -> TokenQuote:
-    best_bid_price = best_bid(book.bids or [])
-    best_ask_price = best_ask(book.asks or [])
-    fair = fair_price(
-        best_bid_price,
-        best_ask_price,
-        _decimal(_field(token, "price", "p"), Decimal("0")),
-        _decimal_or_none(book.last_trade_price),
-    )
+    quote_inputs = build_quote_inputs(token, book)
     return TokenQuote(
         token_id=_token_id(token),
-        fair_price=fair,
-        plan=build_quote_plan(market, token, book, config),
+        fair_price=quote_inputs.fair_price,
+        plan=build_quote_plan(market, token, book, quote_inputs, config),
+    )
+
+
+def build_quote_inputs(token: dict[str, Any], book: OrderBookSummary) -> QuoteInputs:
+    best_bid_price = best_bid(book.bids or [])
+    best_ask_price = best_ask(book.asks or [])
+    return QuoteInputs(
+        fair_price=fair_price(
+            best_bid_price,
+            best_ask_price,
+            _decimal(_field(token, "price", "p"), Decimal("0")),
+            _decimal_or_none(book.last_trade_price),
+        ),
+        best_bid=best_bid_price,
+        best_ask=best_ask_price,
     )
 
 
@@ -332,21 +347,14 @@ def build_quote_plan(
     market: dict[str, Any],
     token: dict[str, Any],
     book: OrderBookSummary,
+    quote_inputs: QuoteInputs,
     config: Config,
 ) -> QuotePlan | None:
-    best_bid_price = best_bid(book.bids or [])
-    best_ask_price = best_ask(book.asks or [])
-    fair = fair_price(
-        best_bid_price,
-        best_ask_price,
-        _decimal(_field(token, "price", "p"), Decimal("0")),
-        _decimal_or_none(book.last_trade_price),
-    )
     tick = _decimal(book.tick_size, Decimal("0.01"))
     buy_price, sell_price = quote_prices(
-        fair,
-        best_bid_price,
-        best_ask_price,
+        quote_inputs.fair_price,
+        quote_inputs.best_bid,
+        quote_inputs.best_ask,
         tick,
         config.edge_ticks,
         config.min_spread_ticks,
@@ -373,9 +381,9 @@ def build_quote_plan(
         question=_market_question(market),
         token_id=_token_id(token),
         outcome=_token_outcome(token),
-        fair_price=fair,
-        best_bid=best_bid_price,
-        best_ask=best_ask_price,
+        fair_price=quote_inputs.fair_price,
+        best_bid=quote_inputs.best_bid,
+        best_ask=quote_inputs.best_ask,
         buy_price=buy_price,
         sell_price=sell_price,
         size=order_size(market, config),
@@ -503,7 +511,7 @@ def conditional_balance(client: ClobClient, token_id: str) -> Decimal:
 
 def proposed_order_from_open_order(order: Any, default_token_id: str) -> ProposedOrder | None:
     side = _response_field(order, "side")
-    if side not in (BUY, SELL):
+    if side is None:
         return None
 
     price = _decimal_or_none(_response_field(order, "price"))

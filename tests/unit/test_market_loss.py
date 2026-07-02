@@ -1,5 +1,7 @@
 from decimal import Decimal
 
+import pytest
+
 from py_market_maker.market_loss import (
     BUY,
     SELL,
@@ -64,3 +66,24 @@ def test_projected_sell_proceeds_offset_loss():
     )
 
     assert loss == Decimal("1.3")
+
+
+def test_non_positive_order_price_is_rejected():
+    exposure = MarketExposure([OutcomeExposure("yes", Decimal("0"), Decimal("0"))])
+
+    with pytest.raises(ValueError, match="price must be greater than zero"):
+        exposure.projected_loss(ProposedOrder("yes", BUY, Decimal("0"), Decimal("5")))
+
+
+def test_non_positive_order_size_is_rejected():
+    exposure = MarketExposure([OutcomeExposure("yes", Decimal("0"), Decimal("0"))])
+
+    with pytest.raises(ValueError, match="size must be greater than zero"):
+        exposure.projected_loss(ProposedOrder("yes", BUY, Decimal("0.50"), Decimal("0")))
+
+
+def test_unknown_order_side_is_rejected():
+    exposure = MarketExposure([OutcomeExposure("yes", Decimal("0"), Decimal("0"))])
+
+    with pytest.raises(ValueError, match="unsupported order side HOLD"):
+        exposure.projected_loss(ProposedOrder("yes", "HOLD", Decimal("0.50"), Decimal("5")))
