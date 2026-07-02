@@ -125,6 +125,23 @@ class InventoryBuyRoom:
     room: Decimal
 
 
+@dataclass(frozen=True)
+class RiskBreach:
+    kind: str
+    value: Decimal
+    limit: Decimal
+    token_id: str | None = None
+
+    def message(self) -> str:
+        if self.kind == "token_inventory":
+            return f"token {self.token_id} inventory {self.value} exceeds limit {self.limit}"
+        if self.kind == "market_inventory":
+            return f"market inventory {self.value} exceeds limit {self.limit}"
+        if self.kind == "market_loss":
+            return f"market loss {self.value} exceeds limit {self.limit}"
+        return f"{self.kind} {self.value} exceeds limit {self.limit}"
+
+
 class LiquidityRejectKind(str, Enum):
     MISSING_TWO_SIDED_BOOK = "missing_two_sided_book"
     INVALID_TICK = "invalid_tick"
@@ -303,6 +320,42 @@ class LiveMarketState:
             ),
             Decimal("0"),
         )
+
+    def risk_breaches(self, config: Config) -> list[RiskBreach]:
+        breaches: list[RiskBreach] = []
+        for token in self.tokens:
+            inventory = self.long_inventory_for_token(token.token_id, [])
+            if inventory > config.max_inventory_per_token:
+                breaches.append(
+                    RiskBreach(
+                        kind="token_inventory",
+                        token_id=token.token_id,
+                        value=inventory,
+                        limit=config.max_inventory_per_token,
+                    )
+                )
+
+        market_inventory = self.long_market_inventory([])
+        if market_inventory > config.max_inventory_per_market:
+            breaches.append(
+                RiskBreach(
+                    kind="market_inventory",
+                    value=market_inventory,
+                    limit=config.max_inventory_per_market,
+                )
+            )
+
+        loss = self.exposure().worst_loss()
+        if loss > config.max_loss_per_market:
+            breaches.append(
+                RiskBreach(
+                    kind="market_loss",
+                    value=loss,
+                    limit=config.max_loss_per_market,
+                )
+            )
+
+        return breaches
 
 
 class ShutdownRequested(Exception):
@@ -825,6 +878,15 @@ def post_quote_plan(
         print(f"skip placing {plan.market_slug} {plan.outcome}: stale live data ({stale_reason})")
         return
 
+    breaches = market_state.risk_breaches(config)
+    if breaches:
+        print_risk_breaches(plan, breaches)
+        if config.cancel_on_risk_breach:
+            refreshed_orders = cancel_risk_increasing_orders(client, plan, open_orders)
+            if refreshed_orders is not None:
+                market_state.replace_open_orders(plan.token_id, refreshed_orders)
+        return
+
     planned_orders: list[SubmittedOrder] = []
     for band in plan.bands():
         open_size = band_open_size(open_orders, band)
@@ -978,6 +1040,36 @@ def pending_buy_size_for_token(orders: list[ProposedOrder], token_id: str) -> De
         (order.size for order in orders if order.token_id == token_id and order.side == BUY),
         Decimal("0"),
     )
+
+
+def print_risk_breaches(plan: QuotePlan, breaches: list[RiskBreach]) -> None:
+    for breach in breaches:
+        print(f"risk breach {plan.market_slug} {plan.outcome}: {breach.message()}")
+
+
+def cancel_risk_increasing_orders(
+    client: ClobClient,
+    plan: QuotePlan,
+    open_orders: list[Any],
+) -> list[Any] | None:
+    order_ids = [
+        order_id
+        for order in open_orders
+        if _response_field(order, "side") == BUY
+        for order_id in [open_order_id(order)]
+        if order_id
+    ]
+    if not order_ids:
+        return None
+
+    response = client.cancel_orders(order_ids)
+    canceled = _response_list(response, "canceled")
+    not_canceled = _response_list(response, "not_canceled")
+    print(
+        f"risk breach cancel {plan.market_slug} {plan.outcome}: "
+        f"canceled={len(canceled)} not_canceled={len(not_canceled)}"
+    )
+    return open_orders_for_token(client, plan.token_id)
 
 
 def market_loss_exceeds_cap(

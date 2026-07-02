@@ -60,6 +60,7 @@ class Config:
     cancel_before_quote: bool
     cancel_all: bool
     cancel_all_on_exit: bool
+    cancel_on_risk_breach: bool
     post_only: bool
     require_two_sided_live: bool
     max_data_age_secs: int
@@ -104,6 +105,7 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
         cancel_before_quote=args.cancel_before_quote,
         cancel_all=args.cancel_all,
         cancel_all_on_exit=args.cancel_all_on_exit,
+        cancel_on_risk_breach=args.cancel_on_risk_breach,
         post_only=args.post_only,
         require_two_sided_live=args.require_two_sided_live,
         max_data_age_secs=args.max_data_age_secs,
@@ -261,6 +263,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=_env_bool("MARKET_MAKER_CANCEL_ALL_ON_EXIT", False),
     )
     parser.add_argument(
+        "--cancel-on-risk-breach",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("MARKET_MAKER_CANCEL_ON_RISK_BREACH", False),
+    )
+    parser.add_argument(
         "--post-only",
         action=argparse.BooleanOptionalAction,
         default=_env_bool("MARKET_MAKER_POST_ONLY", True),
@@ -335,6 +342,8 @@ def validate_config(config: Config, parser: argparse.ArgumentParser) -> None:
         parser.error("MARKET_MAKER_CANCEL_ALL and MARKET_MAKER_CANCEL_ALL_ON_EXIT are mutually exclusive")
     if (config.cancel_all or config.cancel_all_on_exit) and not config.live:
         parser.error("MARKET_MAKER_CANCEL_ALL and MARKET_MAKER_CANCEL_ALL_ON_EXIT require --live")
+    if config.cancel_on_risk_breach and not config.live:
+        parser.error("MARKET_MAKER_CANCEL_ON_RISK_BREACH requires --live")
     if config.max_data_age_secs <= 0:
         parser.error("MARKET_MAKER_MAX_DATA_AGE_SECS must be greater than zero")
     if config.live:
