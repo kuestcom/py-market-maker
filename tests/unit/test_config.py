@@ -27,6 +27,22 @@ def test_zero_market_loss_limit_is_rejected(capsys):
     assert "MARKET_MAKER_MAX_LOSS_PER_MARKET must be greater than zero" in captured.err
 
 
+def test_zero_token_inventory_limit_is_rejected(capsys):
+    with pytest.raises(SystemExit):
+        parse_args(["--max-inventory-per-token", "0"])
+
+    captured = capsys.readouterr()
+    assert "MARKET_MAKER_MAX_INVENTORY_PER_TOKEN must be greater than zero" in captured.err
+
+
+def test_zero_market_inventory_limit_is_rejected(capsys):
+    with pytest.raises(SystemExit):
+        parse_args(["--max-inventory-per-market", "0"])
+
+    captured = capsys.readouterr()
+    assert "MARKET_MAKER_MAX_INVENTORY_PER_MARKET must be greater than zero" in captured.err
+
+
 def test_zero_max_book_spread_is_rejected(capsys):
     with pytest.raises(SystemExit):
         parse_args(["--max-book-spread-ticks", "0"])

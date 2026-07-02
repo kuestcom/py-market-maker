@@ -79,7 +79,9 @@ two-sided book with acceptable spread and top-of-book depth before quoting.
 After cancel requests, live mode refreshes open orders before posting
 replacements; after post responses, it only counts accepted orders as pending
 local exposure. It also skips live posts when order books, token balances, or
-open orders are older than the configured data-age limit.
+open orders are older than the configured data-age limit. Buy-side sizing is
+inventory-aware: token balances, live open buys, and pending buys are counted
+before adding more long exposure to an outcome or market.
 
 By default live mode only posts buy orders.
 
@@ -186,6 +188,15 @@ emergency cancel target.
   Maximum simulated worst-case market loss allowed after existing balances,
   open orders, and the proposed new order are counted. Existing balances are
   marked at current fair value because fill history is not tracked.
+
+  --max-inventory-per-token / MARKET_MAKER_MAX_INVENTORY_PER_TOKEN
+  Default: 25.
+  Maximum long outcome-token inventory allowed after balances, live open buys,
+  pending buys, and staged buys are counted.
+
+  --max-inventory-per-market / MARKET_MAKER_MAX_INVENTORY_PER_MARKET
+  Default: 50.
+  Maximum total long inventory across a market's outcome tokens.
 
   --max-book-spread-ticks / MARKET_MAKER_MAX_BOOK_SPREAD_TICKS
   Default: 20.

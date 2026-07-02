@@ -2,11 +2,13 @@ from decimal import Decimal
 
 from py_market_maker import bot
 from py_market_maker.bot import (
+    InventoryBuyRoom,
     LiveMarketState,
     LiveTokenState,
     QuoteBand,
     QuotePlan,
     post_quote_plan,
+    inventory_adjusted_buy_size,
     stale_input_reason,
 )
 from py_market_maker.config import parse_args
@@ -147,6 +149,82 @@ def test_stale_input_reason_accepts_fresh_data():
     assert stale_input_reason("order book", 100.0, 109.0, 10.0) is None
 
 
+def test_inventory_adjusted_buy_size_caps_to_remaining_room():
+    assert inventory_adjusted_buy_size(Decimal("5"), Decimal("1"), Decimal("3")) == Decimal("3")
+
+
+def test_inventory_adjusted_buy_size_skips_when_room_is_below_minimum():
+    assert inventory_adjusted_buy_size(Decimal("5"), Decimal("1"), Decimal("0.5")) is None
+
+
+def test_inventory_buy_room_counts_balance_and_open_buys():
+    open_buy = _open_order("open-buy", BUY, "0.40", "5")
+    market_state = _market_state(open_orders=[open_buy], balance=Decimal("10"))
+
+    room = market_state.inventory_buy_room(
+        "yes",
+        [],
+        parse_args(["--max-inventory-per-token", "20", "--max-inventory-per-market", "50"]),
+    )
+
+    assert room == InventoryBuyRoom(
+        token_position=Decimal("15"),
+        market_inventory=Decimal("15"),
+        room=Decimal("5"),
+    )
+
+
+def test_inventory_buy_room_ignores_open_sells():
+    open_sell = _open_order("open-sell", SELL, "0.60", "5")
+    market_state = _market_state(open_orders=[open_sell], balance=Decimal("20"))
+
+    room = market_state.inventory_buy_room(
+        "yes",
+        [],
+        parse_args(["--max-inventory-per-token", "25", "--max-inventory-per-market", "50"]),
+    )
+
+    assert room == InventoryBuyRoom(
+        token_position=Decimal("20"),
+        market_inventory=Decimal("20"),
+        room=Decimal("5"),
+    )
+
+
+def test_buy_size_is_capped_by_token_inventory_room():
+    market_state = _market_state(balance=Decimal("22"))
+    client = FakeClient(post_responses=[_post_response(True, "posted")])
+
+    post_quote_plan(
+        client,
+        _plan(buy_band=_buy_band()),
+        parse_args(["--max-inventory-per-token", "25", "--max-inventory-per-market", "50"]),
+        market_state,
+    )
+
+    assert len(client.created_orders) == 1
+    assert Decimal(client.created_orders[0]["size"]) == Decimal("3.0")
+    assert market_state.pending_orders == [
+        ProposedOrder("yes", BUY, Decimal("0.49"), Decimal("3"))
+    ]
+
+
+def test_buy_is_skipped_when_inventory_room_is_below_minimum():
+    market_state = _market_state(balance=Decimal("24.5"))
+    client = FakeClient(post_responses=[_post_response(True, "posted")])
+
+    post_quote_plan(
+        client,
+        _plan(buy_band=_buy_band()),
+        parse_args(["--max-inventory-per-token", "25", "--max-inventory-per-market", "50"]),
+        market_state,
+    )
+
+    assert client.created_orders == []
+    assert client.posted_orders == []
+    assert market_state.pending_orders == []
+
+
 class FakeClient:
     def __init__(self, open_order_pages=None, post_responses=None):
         self.open_order_pages = {
@@ -224,6 +302,7 @@ def _buy_band(avg_size=Decimal("10")):
         price=Decimal("0.49"),
         min_price=Decimal("0.47"),
         max_price=Decimal("0.49"),
+        minimum_size=Decimal("1"),
         min_size=Decimal("5"),
         avg_size=avg_size,
         max_size=Decimal("15"),
@@ -236,6 +315,7 @@ def _sell_band(avg_size=Decimal("10")):
         price=Decimal("0.51"),
         min_price=Decimal("0.51"),
         max_price=Decimal("0.53"),
+        minimum_size=Decimal("1"),
         min_size=Decimal("5"),
         avg_size=avg_size,
         max_size=Decimal("15"),
