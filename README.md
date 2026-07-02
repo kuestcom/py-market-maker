@@ -7,6 +7,8 @@
 
 - Finds active, tradable markets from the fork site and records newly seen
   market ids in `state/seen-markets.json`.
+- Can scope trading to one event by slug, resolving that event's markets from
+  the configured site API.
 - Computes configurable buy/sell quotes per selected outcome token. It defaults
   to buy-only because sell orders require existing outcome-token inventory.
 - Posts GTC limit orders only when `--live` is set. Dry-run is the default.
@@ -46,6 +48,16 @@ or, after installation:
 ```bash
 py-market-maker
 ```
+
+To trade only one event, pass the event slug:
+
+```bash
+python -m py_market_maker --event-slug nba-finals-2026
+```
+
+Event mode reads `.sdk/site-config.json`, uses the configured Kuest site API,
+and fetches only the CLOB markets listed under that event. It does not update
+`state/seen-markets.json`.
 
 ## Live Trading
 
@@ -94,6 +106,10 @@ has zero balance for that outcome token and the order size is 5 shares
 
   --discovery / MARKET_MAKER_DISCOVERY
   Default: auto. Values: auto, sampling, site.
+
+  --event-slug / MARKET_MAKER_EVENT_SLUG
+  Optional. When set, trade only markets under this event slug from
+  .sdk/site-config.json.
 
   --max-markets / MARKET_MAKER_MAX_MARKETS
   Default: 3.

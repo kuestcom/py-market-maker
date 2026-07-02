@@ -12,6 +12,7 @@ from py_clob_client.constants import END_CURSOR
 from py_clob_client.order_builder.constants import BUY, SELL
 
 from .config import Config, DiscoveryMode
+from .event_scope import condition_ids_from_site_config
 from .pricing import fair_price, quote_prices
 from .state import SeenMarkets
 
@@ -45,14 +46,22 @@ def run(config: Config) -> None:
     seen = SeenMarkets.load(config.state_path)
 
     for cycle in range(1, config.cycles + 1):
-        print(f"cycle {cycle}/{config.cycles}: discovering markets")
-
-        markets = discover_markets(public_client, config.discovery, config.max_pages)
-        candidates = select_candidates(markets, seen, config.max_markets)
-        seen.save(config.state_path)
+        event_slug = config.event_slug.strip() if config.event_slug else None
+        if event_slug:
+            print(f"cycle {cycle}/{config.cycles}: discovering markets for event {event_slug}")
+            markets = discover_event_markets(public_client, event_slug, config.max_pages)
+            candidates = select_event_candidates(markets, config.max_markets)
+        else:
+            print(f"cycle {cycle}/{config.cycles}: discovering markets")
+            markets = discover_markets(public_client, config.discovery, config.max_pages)
+            candidates = select_candidates(markets, seen, config.max_markets)
+            seen.save(config.state_path)
 
         new_count = sum(1 for candidate in candidates if candidate.is_new)
-        print(f"found {len(candidates)} tradable fork-scoped markets ({new_count} new)")
+        if event_slug:
+            print(f"event {event_slug}: found {len(candidates)} tradable markets")
+        else:
+            print(f"found {len(candidates)} tradable fork-scoped markets ({new_count} new)")
 
         for candidate in candidates:
             marker = "new" if candidate.is_new else "seen"
@@ -88,6 +97,16 @@ def discover_markets(client: ClobClient, mode: DiscoveryMode, max_pages: int) ->
     return fetch_market_pages(client, mode, max_pages)
 
 
+def discover_event_markets(client: ClobClient, event_slug: str, max_pages: int) -> list[dict[str, Any]]:
+    condition_ids = condition_ids_from_site_config(event_slug, max_pages)
+    markets: list[dict[str, Any]] = []
+    for condition_id in sorted(condition_ids):
+        market = client.get_market(condition_id)
+        if isinstance(market, dict):
+            markets.append(market)
+    return markets
+
+
 def fetch_market_pages(client: ClobClient, mode: DiscoveryMode, max_pages: int) -> list[dict[str, Any]]:
     cursor = INITIAL_CURSOR
     markets: list[dict[str, Any]] = []
@@ -121,6 +140,26 @@ def select_candidates(
 ) -> list[MarketCandidate]:
     candidates = [
         MarketCandidate(market=market, is_new=seen.mark_new(market_key(market)))
+        for market in markets
+        if is_tradable_market(market)
+    ]
+    candidates.sort(
+        key=lambda candidate: (
+            not candidate.is_new,
+            not has_rewards(candidate.market),
+            -_timestamp_sort_value(_field(candidate.market, "accepting_order_timestamp")),
+            _market_slug(candidate.market),
+        )
+    )
+    return candidates[:max_markets]
+
+
+def select_event_candidates(
+    markets: list[dict[str, Any]],
+    max_markets: int,
+) -> list[MarketCandidate]:
+    candidates = [
+        MarketCandidate(market=market, is_new=False)
         for market in markets
         if is_tradable_market(market)
     ]
