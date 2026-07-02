@@ -21,10 +21,11 @@ from py_market_maker.bot import (
     preflight_stale_data_reason,
     quote_market,
     stale_input_reason,
+    token_cost_basis,
 )
 from py_market_maker.config import parse_args
 from py_market_maker.market_loss import BUY, SELL, ProposedOrder
-from py_market_maker.state import PauseState
+from py_market_maker.state import FillLedger, FillRecord, PauseState
 
 
 def test_cancel_refreshes_open_orders_before_posting_replacement():
@@ -241,6 +242,70 @@ def test_inventory_adjusted_buy_size_caps_to_remaining_room():
 
 def test_inventory_adjusted_buy_size_skips_when_room_is_below_minimum():
     assert inventory_adjusted_buy_size(Decimal("5"), Decimal("1"), Decimal("0.5")) is None
+
+
+def test_token_cost_basis_uses_realized_average_cost_after_sells():
+    records = [
+        _fill_record("buy-a", "yes", BUY, "10", "0.40", 1),
+        _fill_record("sell-a", "yes", SELL, "4", "0.70", 2),
+    ]
+
+    assert token_cost_basis(records, Decimal("6"), Decimal("0.50")) == Decimal("2.40")
+
+
+def test_token_cost_basis_falls_back_for_uncovered_balance():
+    records = [_fill_record("buy-a", "yes", BUY, "2", "0.40", 1)]
+
+    assert token_cost_basis(records, Decimal("5"), Decimal("0.50")) == Decimal("2.30")
+
+
+def test_exposure_uses_token_cost_basis_for_existing_balances():
+    market_state = _market_state(balance=Decimal("5"), cost_basis=Decimal("2"))
+
+    assert market_state.exposure().worst_loss() == Decimal("2")
+
+
+def test_live_market_state_fetches_fills_and_uses_cost_basis(tmp_path):
+    token_quotes = [
+        TokenQuote(
+            token_id="yes",
+            outcome="Yes",
+            fair_price=Decimal("0.50"),
+            book_fetched_at=bot.time.monotonic(),
+            plan=None,
+            skip_reason=None,
+        )
+    ]
+    client = FakeClient(
+        balances={"yes": Decimal("5")},
+        trade_pages={
+            "yes": [[{
+                "id": "trade-a",
+                "asset_id": "yes",
+                "market": "market",
+                "side": BUY,
+                "size": "5",
+                "price": "0.40",
+                "status": "Matched",
+                "match_time": 100,
+            }]]
+        },
+    )
+
+    market_state = LiveMarketState.load(
+        client,
+        token_quotes,
+        parse_args([
+            "--fill-state-path",
+            str(tmp_path / "fills.json"),
+            "--fill-max-records",
+            "10",
+        ]),
+    )
+
+    assert market_state.token_state("yes").cost_basis == Decimal("2.00")
+    assert market_state.exposure().worst_loss() == Decimal("2.00")
+    assert FillLedger.load(tmp_path / "fills.json").latest_matched_at_unix_secs("yes") == 100
 
 
 def test_inventory_buy_room_counts_balance_and_open_buys():
@@ -645,7 +710,7 @@ def test_quote_market_reuses_preflight_snapshot_before_pre_post_refresh():
 
 
 class FakeClient:
-    def __init__(self, open_order_pages=None, post_responses=None, books=None, balances=None):
+    def __init__(self, open_order_pages=None, post_responses=None, books=None, balances=None, trade_pages=None):
         self.open_order_pages = {
             token_id: list(pages)
             for token_id, pages in (open_order_pages or {}).items()
@@ -653,11 +718,16 @@ class FakeClient:
         self.post_responses = list(post_responses or [])
         self.books = dict(books or {})
         self.balances = dict(balances or {})
+        self.trade_pages = {
+            token_id: list(pages)
+            for token_id, pages in (trade_pages or {}).items()
+        }
         self.cancel_batches = []
         self.created_orders = []
         self.posted_orders = []
         self.get_order_tokens = []
         self.get_book_tokens = []
+        self.get_trade_tokens = []
 
     def get_order_book(self, token_id):
         self.get_book_tokens.append(token_id)
@@ -666,6 +736,11 @@ class FakeClient:
     def get_balance_allowance(self, params):
         balance = self.balances.get(params.token_id, Decimal("0"))
         return {"balance": str(balance * bot.CONDITIONAL_TOKEN_BASE_UNITS)}
+
+    def get_trades(self, params, next_cursor=None):
+        self.get_trade_tokens.append(params.asset_id)
+        pages = self.trade_pages.get(params.asset_id, [])
+        return list(pages.pop(0)) if pages else {"data": [], "next_cursor": bot.END_CURSOR}
 
     def cancel_orders(self, order_ids):
         self.cancel_batches.append(list(order_ids))
@@ -691,7 +766,7 @@ class FakeClient:
         return self.post_responses.pop(0)
 
 
-def _market_state(open_orders=None, balance=Decimal("0"), no_balance=Decimal("0"), now=None):
+def _market_state(open_orders=None, balance=Decimal("0"), no_balance=Decimal("0"), cost_basis=None, now=None):
     now = bot.time.monotonic() if now is None else now
     return LiveMarketState(
         tokens=[
@@ -702,6 +777,7 @@ def _market_state(open_orders=None, balance=Decimal("0"), no_balance=Decimal("0"
                 balance_fetched_at=now,
                 open_orders=list(open_orders or []),
                 open_orders_fetched_at=now,
+                cost_basis=cost_basis,
             ),
             LiveTokenState("no", Decimal("0.50"), no_balance, now, [], now),
         ],
@@ -761,6 +837,19 @@ def _open_order(order_id, side, price, size):
         "original_size": size,
         "size_matched": "0",
     }
+
+
+def _fill_record(record_id, token_id, side, size, price, matched_at_unix_secs):
+    return FillRecord(
+        id=record_id,
+        token_id=token_id,
+        market="market",
+        side=side,
+        size=Decimal(size),
+        price=Decimal(price),
+        status="Matched",
+        matched_at_unix_secs=matched_at_unix_secs,
+    )
 
 
 def _post_response(success, order_id):
