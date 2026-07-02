@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import signal
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
@@ -110,6 +111,19 @@ class PreflightRiskAuditResult(str, Enum):
     CONTINUE = "continue"
     SKIP_CYCLE = "skip_cycle"
     STOP = "stop"
+
+
+@dataclass(frozen=True)
+class PreflightMarketSnapshot:
+    market_key: str
+    token_quotes: list[TokenQuote]
+    market_state: "LiveMarketState"
+
+
+@dataclass(frozen=True)
+class PreflightRiskAudit:
+    result: PreflightRiskAuditResult
+    snapshots: list[PreflightMarketSnapshot]
 
 
 @dataclass(frozen=True)
@@ -449,6 +463,7 @@ def run_cycles(
         if config.discover_only:
             continue
 
+        preflight_snapshots: deque[PreflightMarketSnapshot] = deque()
         if live_client is not None:
             preflight = preflight_risk_audit(
                 public_client,
@@ -456,15 +471,21 @@ def run_cycles(
                 [candidate.market for candidate in candidates],
                 config,
             )
-            if preflight == PreflightRiskAuditResult.SKIP_CYCLE:
+            if preflight.result == PreflightRiskAuditResult.SKIP_CYCLE:
                 if cycle < config.cycles:
                     time.sleep(config.refresh_secs)
                 continue
-            if preflight == PreflightRiskAuditResult.STOP:
+            if preflight.result == PreflightRiskAuditResult.STOP:
                 return
+            preflight_snapshots = deque(preflight.snapshots)
 
         for candidate in candidates:
-            quote_market(public_client, live_client, candidate.market, config)
+            preflight_snapshot = None
+            if live_client is not None:
+                if not preflight_snapshots:
+                    raise RuntimeError("missing preflight snapshot for live quote")
+                preflight_snapshot = preflight_snapshots.popleft()
+            quote_market(public_client, live_client, candidate.market, config, preflight_snapshot)
             if stop_if_paused(config):
                 return
 
@@ -635,8 +656,16 @@ def quote_market(
     live_client: ClobClient | None,
     market: dict[str, Any],
     config: Config,
+    preflight_snapshot: PreflightMarketSnapshot | None = None,
 ) -> None:
-    token_quotes = build_market_token_quotes(public_client, market, config)
+    snapshot = preflight_snapshot_for_market(preflight_snapshot, market_key(market))
+    if snapshot is not None:
+        token_quotes = snapshot.token_quotes
+        preflight_market_state = snapshot.market_state
+    else:
+        token_quotes = build_market_token_quotes(public_client, market, config)
+        preflight_market_state = None
+
     for token_quote in token_quotes:
         if token_quote.plan is None:
             reason = token_quote.skip_reason or "no safe quote at configured edge/sides"
@@ -648,7 +677,12 @@ def quote_market(
     if live_client is None:
         return
 
-    market_state = LiveMarketState.load(live_client, token_quotes)
+    market_state = preflight_market_state if preflight_market_state is not None else LiveMarketState.load(live_client, token_quotes)
+    stale_reason = preflight_stale_data_reason(token_quotes, market_state, time.monotonic(), config)
+    if stale_reason is not None:
+        print(f"skip live quote {_market_slug(market)}: stale live data ({stale_reason})")
+        return
+
     for token_quote in token_quotes:
         if stop_if_paused(config):
             return
@@ -663,33 +697,34 @@ def preflight_risk_audit(
     live_client: ClobClient,
     markets: list[dict[str, Any]],
     config: Config,
-) -> PreflightRiskAuditResult:
+) -> PreflightRiskAudit:
     if not markets:
-        return PreflightRiskAuditResult.CONTINUE
+        return PreflightRiskAudit(PreflightRiskAuditResult.CONTINUE, [])
 
     print(f"preflight risk audit: checking {len(markets)} markets")
+    snapshots: list[PreflightMarketSnapshot] = []
     for market in markets:
         pause = PauseState.load(config.pause_path)
         if pause is not None:
             print(f"preflight risk audit stopped by {config.pause_path}: {pause.reason.strip()}")
-            return PreflightRiskAuditResult.STOP
+            return PreflightRiskAudit(PreflightRiskAuditResult.STOP, snapshots)
 
         try:
             token_quotes = build_market_token_quotes(public_client, market, config)
         except Exception as error:
             print(f"preflight risk audit skip {_market_slug(market)}: failed to fetch order books ({error})")
-            return PreflightRiskAuditResult.SKIP_CYCLE
+            return PreflightRiskAudit(PreflightRiskAuditResult.SKIP_CYCLE, snapshots)
 
         try:
             market_state = LiveMarketState.load(live_client, token_quotes)
         except Exception as error:
             print(f"preflight risk audit skip {_market_slug(market)}: failed to fetch live state ({error})")
-            return PreflightRiskAuditResult.SKIP_CYCLE
+            return PreflightRiskAudit(PreflightRiskAuditResult.SKIP_CYCLE, snapshots)
 
         stale_reason = preflight_stale_data_reason(token_quotes, market_state, time.monotonic(), config)
         if stale_reason is not None:
             print(f"preflight risk audit skip {_market_slug(market)}: stale live data ({stale_reason})")
-            return PreflightRiskAuditResult.SKIP_CYCLE
+            return PreflightRiskAudit(PreflightRiskAuditResult.SKIP_CYCLE, snapshots)
 
         breaches = market_state.risk_breaches(config)
         if breaches:
@@ -700,10 +735,31 @@ def preflight_risk_audit(
                 reason = preflight_breach_pause_reason(market, breaches)
                 PauseState.save_reason(config.pause_path, reason)
                 print(f"wrote pause file {config.pause_path}: {reason}")
-                return PreflightRiskAuditResult.STOP
-            return PreflightRiskAuditResult.SKIP_CYCLE
+                return PreflightRiskAudit(PreflightRiskAuditResult.STOP, snapshots)
+            return PreflightRiskAudit(PreflightRiskAuditResult.SKIP_CYCLE, snapshots)
 
-    return PreflightRiskAuditResult.CONTINUE
+        snapshots.append(
+            PreflightMarketSnapshot(
+                market_key=market_key(market),
+                token_quotes=token_quotes,
+                market_state=market_state,
+            )
+        )
+
+    return PreflightRiskAudit(PreflightRiskAuditResult.CONTINUE, snapshots)
+
+
+def preflight_snapshot_for_market(
+    snapshot: PreflightMarketSnapshot | None,
+    expected_market_key: str,
+) -> PreflightMarketSnapshot | None:
+    if snapshot is None:
+        return None
+    if snapshot.market_key != expected_market_key:
+        raise RuntimeError(
+            f"preflight snapshot market mismatch: expected {expected_market_key}, got {snapshot.market_key}"
+        )
+    return snapshot
 
 
 def build_market_token_quotes(

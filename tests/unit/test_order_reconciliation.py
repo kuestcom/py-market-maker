@@ -7,6 +7,7 @@ from py_market_maker.bot import (
     InventoryBuyRoom,
     LiveMarketState,
     LiveTokenState,
+    PreflightMarketSnapshot,
     PreflightRiskAuditResult,
     QuoteBand,
     QuotePlan,
@@ -14,7 +15,9 @@ from py_market_maker.bot import (
     post_quote_plan,
     inventory_adjusted_buy_size,
     preflight_risk_audit,
+    preflight_snapshot_for_market,
     preflight_stale_data_reason,
+    quote_market,
     stale_input_reason,
 )
 from py_market_maker.config import parse_args
@@ -474,7 +477,7 @@ def test_preflight_risk_audit_cancels_and_pauses_on_market_breach(tmp_path):
     )
 
     pause = PauseState.load(pause_path)
-    assert result == PreflightRiskAuditResult.STOP
+    assert result.result == PreflightRiskAuditResult.STOP
     assert client.cancel_batches == [["open-buy"]]
     assert pause is not None
     assert pause.reason == "preflight risk breach market: token yes inventory 16 exceeds limit 10"
@@ -503,8 +506,68 @@ def test_preflight_risk_audit_skips_cycle_on_breach_without_pause():
         ]),
     )
 
-    assert result == PreflightRiskAuditResult.SKIP_CYCLE
+    assert result.result == PreflightRiskAuditResult.SKIP_CYCLE
     assert client.cancel_batches == []
+
+
+def test_preflight_risk_audit_returns_market_snapshots():
+    client = FakeClient(
+        books={"yes": _book()},
+        balances={"yes": Decimal("1")},
+    )
+
+    result = preflight_risk_audit(
+        client,
+        client,
+        [_market()],
+        parse_args([]),
+    )
+
+    assert result.result == PreflightRiskAuditResult.CONTINUE
+    assert len(result.snapshots) == 1
+    assert result.snapshots[0].market_key == "market"
+    assert [quote.token_id for quote in result.snapshots[0].token_quotes] == ["yes"]
+    assert result.snapshots[0].market_state.token_state("yes").balance == Decimal("1")
+
+
+def test_preflight_snapshot_rejects_market_key_mismatch():
+    snapshot = PreflightMarketSnapshot(
+        market_key="market-a",
+        token_quotes=[],
+        market_state=_market_state(),
+    )
+
+    try:
+        preflight_snapshot_for_market(snapshot, "market-b")
+    except RuntimeError as error:
+        assert "preflight snapshot market mismatch" in str(error)
+    else:
+        raise AssertionError("mismatched preflight snapshot should fail")
+
+
+def test_quote_market_reuses_preflight_snapshot_without_refetching_book():
+    market_state = _market_state()
+    snapshot = PreflightMarketSnapshot(
+        market_key="market",
+        token_quotes=[
+            TokenQuote(
+                token_id="yes",
+                outcome="Yes",
+                fair_price=Decimal("0.50"),
+                book_fetched_at=bot.time.monotonic(),
+                plan=_plan(buy_band=_buy_band()),
+                skip_reason=None,
+            )
+        ],
+        market_state=market_state,
+    )
+    client = FakeClient(post_responses=[_post_response(True, "posted")])
+
+    quote_market(client, client, _market(), parse_args([]), snapshot)
+
+    assert client.get_book_tokens == []
+    assert len(client.created_orders) == 1
+    assert len(client.posted_orders) == 1
 
 
 class FakeClient:
@@ -520,8 +583,10 @@ class FakeClient:
         self.created_orders = []
         self.posted_orders = []
         self.get_order_tokens = []
+        self.get_book_tokens = []
 
     def get_order_book(self, token_id):
+        self.get_book_tokens.append(token_id)
         return self.books[token_id]
 
     def get_balance_allowance(self, params):

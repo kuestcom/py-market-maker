@@ -6,6 +6,7 @@ from py_market_maker import bot
 from py_market_maker.bot import (
     CANCEL_ORDER_BATCH_SIZE,
     MarketCandidate,
+    PreflightRiskAudit,
     PreflightRiskAuditResult,
     ShutdownRequested,
     cancel_open_orders_for_markets,
@@ -131,12 +132,12 @@ def test_run_cycles_skips_quote_when_preflight_skips_cycle(monkeypatch, tmp_path
     monkeypatch.setattr(
         bot,
         "preflight_risk_audit",
-        lambda *_args, **_kwargs: PreflightRiskAuditResult.SKIP_CYCLE,
+        lambda *_args, **_kwargs: PreflightRiskAudit(PreflightRiskAuditResult.SKIP_CYCLE, []),
     )
     monkeypatch.setattr(
         bot,
         "quote_market",
-        lambda _public_client, _live_client, market, _config: quoted_markets.append(market),
+        lambda _public_client, _live_client, market, _config, _snapshot=None: quoted_markets.append(market),
     )
 
     bot.run_cycles(
