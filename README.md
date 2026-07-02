@@ -76,6 +76,9 @@ for Amoy.
 Before posting live orders, the bot blocks quotes whose simulated fill would
 exceed the configured market loss cap. By default, live mode also requires a
 two-sided book with acceptable spread and top-of-book depth before quoting.
+After cancel requests, live mode refreshes open orders before posting
+replacements; after post responses, it only counts accepted orders as pending
+local exposure.
 
 By default live mode only posts buy orders.
 
