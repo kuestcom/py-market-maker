@@ -674,7 +674,7 @@ def cancellable_orders(open_orders: list[Any], plan: QuotePlan) -> list[Any]:
             continue
 
         band_amount = matching_size
-        matching_orders.sort(key=lambda order: (band.cancel_priority(order), open_order_created_at(order)))
+        matching_orders.sort(key=lambda order: (-band.cancel_priority(order), open_order_created_at(order)))
         for order in matching_orders:
             if band_amount <= band.avg_size:
                 break
