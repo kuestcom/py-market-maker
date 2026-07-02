@@ -111,6 +111,31 @@ def test_stale_book_skips_live_post(monkeypatch):
     assert market_state.pending_orders == []
 
 
+def test_stale_book_after_cancel_refresh_skips_replacement_post(monkeypatch):
+    times = iter([109.0, 109.5, 111.0])
+    monkeypatch.setattr(bot.time, "monotonic", lambda: next(times))
+    stale_order = _open_order("stale", BUY, "0.46", "5")
+    market_state = _market_state(open_orders=[stale_order], now=100.0)
+    client = FakeClient(
+        open_order_pages={"yes": [[]]},
+        post_responses=[_post_response(True, "posted")],
+    )
+
+    post_quote_plan(
+        client,
+        _plan(buy_band=_buy_band(), book_fetched_at=100.0),
+        parse_args(["--max-data-age-secs", "10"]),
+        market_state,
+    )
+
+    assert client.cancel_batches == [["stale"]]
+    assert client.get_order_tokens == ["yes"]
+    assert client.created_orders == []
+    assert client.posted_orders == []
+    assert market_state.open_orders("yes") == []
+    assert market_state.pending_orders == []
+
+
 def test_stale_input_reason_flags_data_older_than_threshold():
     reason = stale_input_reason("order book", 100.0, 111.0, 10.0)
 

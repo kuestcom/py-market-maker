@@ -764,6 +764,11 @@ def post_quote_plan(
                 print(f"skip placing {plan.market_slug} {plan.outcome}: canceled order state is still unstable")
                 return
 
+    stale_reason = stale_live_data_reason(plan, market_state, time.monotonic(), config)
+    if stale_reason is not None:
+        print(f"skip placing {plan.market_slug} {plan.outcome}: stale live data ({stale_reason})")
+        return
+
     planned_orders: list[SubmittedOrder] = []
     for band in plan.bands():
         open_size = band_open_size(open_orders, band)
