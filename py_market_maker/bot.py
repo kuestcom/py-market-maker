@@ -20,10 +20,10 @@ from py_clob_client.clob_types import (
 from py_clob_client.constants import END_CURSOR
 from py_clob_client.order_builder.constants import BUY, SELL
 
-from .config import Config, DiscoveryMode
+from .config import Config, DiscoveryMode, band_margin_ticks, band_sizes
 from .event_scope import condition_id_from_market, condition_ids_from_site_config
 from .market_loss import MarketExposure, OutcomeExposure, ProposedOrder
-from .pricing import fair_price, quote_prices
+from .pricing import ceil_to_tick, fair_price, floor_to_tick, is_tradeable_price
 from .state import SeenMarkets
 
 INITIAL_CURSOR = "MA=="
@@ -46,9 +46,38 @@ class QuotePlan:
     fair_price: Decimal
     best_bid: Decimal | None
     best_ask: Decimal | None
-    buy_price: Decimal | None
-    sell_price: Decimal | None
-    size: Decimal
+    buy_band: QuoteBand | None
+    sell_band: QuoteBand | None
+
+    def bands(self) -> list["QuoteBand"]:
+        return [band for band in (self.buy_band, self.sell_band) if band is not None]
+
+
+@dataclass(frozen=True)
+class QuoteBand:
+    side: str
+    price: Decimal
+    min_price: Decimal
+    max_price: Decimal
+    min_size: Decimal
+    avg_size: Decimal
+    max_size: Decimal
+
+    def contains_price(self, price: Decimal) -> bool:
+        return self.min_price <= price <= self.max_price
+
+    def includes_order(self, order: Any) -> bool:
+        side = _response_field(order, "side")
+        price = _decimal_or_none(_response_field(order, "price"))
+        return side == self.side and price is not None and self.contains_price(price)
+
+    def cancel_priority(self, order: Any) -> Decimal:
+        price = _decimal(_response_field(order, "price"), Decimal("0"))
+        if self.side == BUY:
+            return max(self.max_price - price, Decimal("0"))
+        if self.side == SELL:
+            return max(price - self.min_price, Decimal("0"))
+        return Decimal("0")
 
 
 @dataclass(frozen=True)
@@ -146,6 +175,12 @@ class LiveMarketState:
 
     def record_pending_order(self, order: ProposedOrder) -> None:
         self.pending_orders.append(order)
+
+    def open_orders(self, token_id: str) -> list[Any]:
+        for token in self.tokens:
+            if token.token_id == token_id:
+                return list(token.open_orders)
+        return []
 
     def remove_open_orders(self, token_id: str, order_ids: set[str]) -> None:
         if not order_ids:
@@ -391,28 +426,19 @@ def build_quote_plan(
     config: Config,
 ) -> QuotePlan | None:
     tick = _decimal(book.tick_size, Decimal("0.01"))
-    buy_price, sell_price = quote_prices(
-        quote_inputs.fair_price,
-        quote_inputs.best_bid,
-        quote_inputs.best_ask,
-        tick,
-        config.edge_ticks,
-        config.min_spread_ticks,
-    )
+    buy_band = build_quote_band(market, BUY, quote_inputs, tick, config) if config.quote_sides.includes_buy() else None
+    sell_band = build_quote_band(market, SELL, quote_inputs, tick, config) if config.quote_sides.includes_sell() else None
 
-    if not config.quote_sides.includes_buy():
-        buy_price = None
-    if not config.quote_sides.includes_sell():
-        sell_price = None
-
-    if not config.allow_single_sided and (buy_price is None or sell_price is None):
+    if not config.allow_single_sided and (buy_band is None or sell_band is None):
         return None
 
-    if buy_price is not None and sell_price is not None and buy_price >= sell_price:
-        buy_price = None
-        sell_price = None
+    if buy_band is not None and sell_band is not None:
+        tick_spread = tick * Decimal(config.min_spread_ticks)
+        if sell_band.price - buy_band.price < tick_spread:
+            buy_band = None
+            sell_band = None
 
-    if buy_price is None and sell_price is None:
+    if buy_band is None and sell_band is None:
         return None
 
     return QuotePlan(
@@ -424,14 +450,60 @@ def build_quote_plan(
         fair_price=quote_inputs.fair_price,
         best_bid=quote_inputs.best_bid,
         best_ask=quote_inputs.best_ask,
-        buy_price=buy_price,
-        sell_price=sell_price,
-        size=order_size(market, config),
+        buy_band=buy_band,
+        sell_band=sell_band,
     )
 
 
-def order_size(market: dict[str, Any], config: Config) -> Decimal:
-    size = max(config.order_size, _decimal(_field(market, "minimum_order_size"), Decimal("0")))
+def build_quote_band(
+    market: dict[str, Any],
+    side: str,
+    quote_inputs: QuoteInputs,
+    tick: Decimal,
+    config: Config,
+) -> QuoteBand | None:
+    if tick <= Decimal("0"):
+        return None
+
+    min_margin_ticks, avg_margin_ticks, max_margin_ticks = band_margin_ticks(config)
+    min_size, avg_size, max_size = band_sizes(config)
+    min_margin = tick * Decimal(min_margin_ticks)
+    avg_margin = tick * Decimal(avg_margin_ticks)
+    max_margin = tick * Decimal(max_margin_ticks)
+
+    if side == BUY:
+        price = floor_to_tick(quote_inputs.fair_price - avg_margin, tick)
+        min_price = floor_to_tick(quote_inputs.fair_price - max_margin, tick)
+        max_price = floor_to_tick(quote_inputs.fair_price - min_margin, tick)
+        if quote_inputs.best_ask is not None and price >= quote_inputs.best_ask:
+            return None
+    elif side == SELL:
+        price = ceil_to_tick(quote_inputs.fair_price + avg_margin, tick)
+        min_price = ceil_to_tick(quote_inputs.fair_price + min_margin, tick)
+        max_price = ceil_to_tick(quote_inputs.fair_price + max_margin, tick)
+        if quote_inputs.best_bid is not None and price <= quote_inputs.best_bid:
+            return None
+    else:
+        return None
+
+    min_price = max(min_price, tick)
+    max_price = min(max_price, Decimal("1") - tick)
+    if not is_tradeable_price(price, tick) or min_price > max_price:
+        return None
+
+    return QuoteBand(
+        side=side,
+        price=price,
+        min_price=min_price,
+        max_price=max_price,
+        min_size=order_size(market, min_size, config),
+        avg_size=order_size(market, avg_size, config),
+        max_size=order_size(market, max_size, config),
+    )
+
+
+def order_size(market: dict[str, Any], requested_size: Decimal, config: Config) -> Decimal:
+    size = max(requested_size, _decimal(_field(market, "minimum_order_size"), Decimal("0")))
     if config.respect_reward_min_size:
         size = max(size, _decimal(_dict_field(market, "rewards").get("min_size"), Decimal("0")))
     return size
@@ -512,8 +584,17 @@ def print_plan(plan: QuotePlan, live: bool) -> None:
     print(
         f"{mode}: {plan.market_key} :: {plan.market_slug} :: {plan.question} :: "
         f"{plan.outcome} ({plan.token_id}) fair={plan.fair_price} "
-        f"bid={plan.best_bid} ask={plan.best_ask} buy={plan.buy_price} "
-        f"sell={plan.sell_price} size={plan.size}"
+        f"bid={plan.best_bid} ask={plan.best_ask} buy={format_band(plan.buy_band)} "
+        f"sell={format_band(plan.sell_band)}"
+    )
+
+
+def format_band(band: QuoteBand | None) -> str:
+    if band is None:
+        return "none"
+    return (
+        f"price={band.price} band=[{band.min_price}, {band.max_price}] "
+        f"size={band.min_size}/{band.avg_size}/{band.max_size}"
     )
 
 
@@ -523,70 +604,110 @@ def post_quote_plan(
     config: Config,
     market_state: LiveMarketState,
 ) -> None:
+    open_orders = market_state.open_orders(plan.token_id)
     if config.cancel_before_quote:
-        response = client.cancel_market_orders(asset_id=plan.token_id)
+        orders_to_cancel = cancellable_orders(open_orders, plan)
+        order_ids = [open_order_id(order) for order in orders_to_cancel if open_order_id(order)]
+        response = client.cancel_orders(order_ids) if order_ids else {}
         canceled = _response_list(response, "canceled")
         not_canceled = _response_list(response, "not_canceled")
-        if canceled or not_canceled:
+        if order_ids or not_canceled:
             print(
-                f"canceled stale orders for {plan.token_id}: "
-                f"canceled={len(canceled)} not_canceled={len(not_canceled)}"
+                f"canceled band orders for {plan.token_id}: "
+                f"requested={len(order_ids)} canceled={len(canceled)} not_canceled={len(not_canceled)}"
             )
         market_state.remove_open_orders(
             plan.token_id,
             {order_id for item in canceled for order_id in [response_item_id(item)] if order_id},
         )
+        if canceled:
+            open_orders = market_state.open_orders(plan.token_id)
 
     responses = []
-    post_buy = plan.buy_price is not None
-    if post_buy:
+    for band in plan.bands():
+        open_size = band_open_size(open_orders, band)
+        missing_size = band_missing_size(band, open_size)
+        if missing_size is None:
+            continue
+
         proposed = ProposedOrder(
             token_id=plan.token_id,
-            side=BUY,
-            price=plan.buy_price,
-            size=plan.size,
+            side=band.side,
+            price=band.price,
+            size=missing_size,
         )
         if market_loss_exceeds_cap(plan, proposed, market_state, config):
-            post_buy = False
-        else:
-            market_state.record_pending_order(proposed)
-
-    if post_buy:
+            continue
         order = client.create_order(
             OrderArgs(
                 token_id=plan.token_id,
-                price=float(plan.buy_price),
-                size=float(plan.size),
-                side=BUY,
+                price=float(band.price),
+                size=float(missing_size),
+                side=band.side,
             )
         )
-        responses.append((BUY, client.post_order(order, orderType=OrderType.GTC, post_only=config.post_only)))
-
-    post_sell = plan.sell_price is not None
-    if post_sell:
-        proposed = ProposedOrder(
-            token_id=plan.token_id,
-            side=SELL,
-            price=plan.sell_price,
-            size=plan.size,
-        )
-        if market_loss_exceeds_cap(plan, proposed, market_state, config):
-            post_sell = False
-        else:
-            market_state.record_pending_order(proposed)
-
-    if post_sell:
-        order = client.create_order(
-            OrderArgs(
-                token_id=plan.token_id,
-                price=float(plan.sell_price),
-                size=float(plan.size),
-                side=SELL,
-            )
-        )
-        responses.append((SELL, client.post_order(order, orderType=OrderType.GTC, post_only=config.post_only)))
+        market_state.record_pending_order(proposed)
+        responses.append((band.side, client.post_order(order, orderType=OrderType.GTC, post_only=config.post_only)))
 
     print_post_responses(plan, responses)
+
+
+def cancellable_orders(open_orders: list[Any], plan: QuotePlan) -> list[Any]:
+    cancellable: list[Any] = []
+    cancellable_ids: set[str] = set()
+
+    for order in open_orders:
+        if order_should_cancel(order, plan):
+            order_id = open_order_id(order)
+            if order_id and order_id not in cancellable_ids:
+                cancellable_ids.add(order_id)
+                cancellable.append(order)
+
+    for band in plan.bands():
+        matching_orders = [
+            order
+            for order in open_orders
+            if open_order_id(order) not in cancellable_ids and band.includes_order(order)
+        ]
+        matching_size = sum((open_order_remaining_size(order) for order in matching_orders), Decimal("0"))
+        if matching_size <= band.max_size:
+            continue
+
+        band_amount = matching_size
+        matching_orders.sort(key=lambda order: (band.cancel_priority(order), open_order_created_at(order)))
+        for order in matching_orders:
+            if band_amount <= band.avg_size:
+                break
+            order_id = open_order_id(order)
+            if not order_id or order_id in cancellable_ids:
+                continue
+            cancellable_ids.add(order_id)
+            cancellable.append(order)
+            band_amount = max(band_amount - open_order_remaining_size(order), Decimal("0"))
+
+    return cancellable
+
+
+def order_should_cancel(order: Any, plan: QuotePlan) -> bool:
+    side = _response_field(order, "side")
+    if side == BUY:
+        return plan.buy_band is None or not plan.buy_band.includes_order(order)
+    if side == SELL:
+        return plan.sell_band is None or not plan.sell_band.includes_order(order)
+    return True
+
+
+def band_open_size(open_orders: list[Any], band: QuoteBand) -> Decimal:
+    return sum(
+        (open_order_remaining_size(order) for order in open_orders if band.includes_order(order)),
+        Decimal("0"),
+    )
+
+
+def band_missing_size(band: QuoteBand, open_size: Decimal) -> Decimal | None:
+    if open_size >= band.min_size:
+        return None
+    return max(band.avg_size - open_size, Decimal("0"))
 
 
 def market_loss_exceeds_cap(
@@ -658,6 +779,10 @@ def response_item_id(item: Any) -> str:
         return item
     value = _response_field(item, "id", "order_id", "orderID")
     return str(value) if value is not None else ""
+
+
+def open_order_created_at(order: Any) -> float:
+    return _timestamp_sort_value(_response_field(order, "created_at", "createdAt"))
 
 
 def print_post_responses(plan: QuotePlan, responses: list[tuple[str, Any]]) -> None:
