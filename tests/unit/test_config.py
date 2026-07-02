@@ -192,6 +192,13 @@ def test_zero_fill_max_records_is_rejected(capsys):
     assert "MARKET_MAKER_FILL_MAX_RECORDS must be greater than zero" in captured.err
 
 
+def test_clear_pause_skips_fill_max_records_validation():
+    config = parse_args(["--clear-pause", "--fill-max-records", "0"])
+
+    assert config.clear_pause is True
+    assert config.fill_max_records == 0
+
+
 def _live_args():
     return [
         "--live",

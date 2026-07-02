@@ -344,12 +344,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def validate_config(config: Config, parser: argparse.ArgumentParser) -> None:
-    if config.fill_max_records <= 0:
-        parser.error("MARKET_MAKER_FILL_MAX_RECORDS must be greater than zero")
     if config.clear_pause and (config.cancel_all or config.cancel_all_on_exit):
         parser.error("MARKET_MAKER_CLEAR_PAUSE cannot be combined with cancel-all actions")
     if config.clear_pause:
         return
+    if config.fill_max_records <= 0:
+        parser.error("MARKET_MAKER_FILL_MAX_RECORDS must be greater than zero")
     if config.max_markets <= 0:
         parser.error("MARKET_MAKER_MAX_MARKETS must be greater than zero")
     if config.max_pages <= 0:

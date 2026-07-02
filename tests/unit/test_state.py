@@ -103,3 +103,78 @@ def test_fill_ledger_prunes_oldest_records():
 
     assert set(ledger.trades) == {"trade-b", "trade-c"}
     assert not ledger.prune_to_max_records(2)
+
+
+def test_fill_ledger_rejects_key_id_mismatch(tmp_path):
+    path = tmp_path / "state" / "fills.json"
+    path.parent.mkdir()
+    path.write_text(
+        json.dumps({
+            "trades": {
+                "trade-key": {
+                    "id": "trade-inner",
+                    "token_id": "1",
+                    "market": "market-a",
+                    "side": "BUY",
+                    "size": "1",
+                    "price": "0.50",
+                    "status": "Matched",
+                    "matched_at_unix_secs": 1,
+                }
+            }
+        }),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="fill record key must match id"):
+        FillLedger.load(path)
+
+
+def test_fill_ledger_rejects_boolean_timestamp(tmp_path):
+    path = tmp_path / "state" / "fills.json"
+    path.parent.mkdir()
+    path.write_text(
+        json.dumps({
+            "trades": {
+                "trade-a": {
+                    "id": "trade-a",
+                    "token_id": "1",
+                    "market": "market-a",
+                    "side": "BUY",
+                    "size": "1",
+                    "price": "0.50",
+                    "status": "Matched",
+                    "matched_at_unix_secs": True,
+                }
+            }
+        }),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="invalid fill record"):
+        FillLedger.load(path)
+
+
+def test_fill_ledger_rejects_non_finite_decimal(tmp_path):
+    path = tmp_path / "state" / "fills.json"
+    path.parent.mkdir()
+    path.write_text(
+        json.dumps({
+            "trades": {
+                "trade-a": {
+                    "id": "trade-a",
+                    "token_id": "1",
+                    "market": "market-a",
+                    "side": "BUY",
+                    "size": "NaN",
+                    "price": "0.50",
+                    "status": "Matched",
+                    "matched_at_unix_secs": 1,
+                }
+            }
+        }),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="invalid fill record"):
+        FillLedger.load(path)

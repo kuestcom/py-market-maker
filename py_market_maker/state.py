@@ -171,10 +171,13 @@ class FillLedger:
         trades = parsed.get("trades") if isinstance(parsed, dict) else None
         if not isinstance(trades, dict):
             raise RuntimeError(f"failed to parse {path}: trades must be an object")
-        records = {
-            str(record_id): FillRecord.from_json(record, path)
-            for record_id, record in trades.items()
-        }
+        records = {}
+        for record_id, raw_record in trades.items():
+            record = FillRecord.from_json(raw_record, path)
+            record_key = str(record_id)
+            if record_key != record.id:
+                raise RuntimeError(f"failed to parse {path}: fill record key must match id")
+            records[record_key] = record
         return cls(records)
 
     def save(self, path: Path) -> None:
@@ -235,10 +238,13 @@ def _required_str(value: dict[str, object], key: str) -> str:
 
 def _required_int(value: dict[str, object], key: str) -> int:
     field_value = value.get(key)
-    if not isinstance(field_value, int):
+    if type(field_value) is not int:
         raise TypeError(key)
     return field_value
 
 
 def _decimal(value: object) -> Decimal:
-    return Decimal(str(value))
+    parsed = Decimal(str(value))
+    if not parsed.is_finite():
+        raise ValueError("decimal must be finite")
+    return parsed
