@@ -14,6 +14,8 @@ from py_market_maker.bot import (
     TokenQuote,
     post_quote_plan,
     inventory_adjusted_buy_size,
+    pre_post_liquidity_reject_reason,
+    price_move_reject_reason,
     preflight_risk_audit,
     preflight_snapshot_for_market,
     preflight_stale_data_reason,
@@ -157,6 +159,54 @@ def test_stale_input_reason_flags_data_older_than_threshold():
 
 def test_stale_input_reason_accepts_fresh_data():
     assert stale_input_reason("order book", 100.0, 109.0, 10.0) is None
+
+
+def test_price_move_guard_rejects_large_fair_move():
+    reason = price_move_reject_reason(
+        Decimal("0.50"),
+        Decimal("0.53"),
+        Decimal("0.01"),
+        2,
+    )
+
+    assert reason is not None
+    assert "fair moved 3 ticks" in reason
+
+
+def test_price_move_guard_allows_move_at_limit():
+    assert price_move_reject_reason(
+        Decimal("0.50"),
+        Decimal("0.52"),
+        Decimal("0.01"),
+        2,
+    ) is None
+
+
+def test_pre_post_liquidity_guard_rejects_missing_two_sided_book():
+    reason = pre_post_liquidity_reject_reason(
+        OrderBookSummary(
+            bids=[OrderSummary(price="0.49", size="10")],
+            asks=[],
+            tick_size="0.01",
+        ),
+        parse_args(_live_args()),
+    )
+
+    assert reason is not None
+    assert "missing" in reason.message()
+
+
+def test_pre_post_liquidity_guard_follows_live_flag():
+    reason = pre_post_liquidity_reject_reason(
+        OrderBookSummary(
+            bids=[OrderSummary(price="0.49", size="10")],
+            asks=[],
+            tick_size="0.01",
+        ),
+        parse_args(["--require-two-sided-live"]),
+    )
+
+    assert reason is None
 
 
 def test_preflight_stale_data_reason_flags_stale_token_inputs():
@@ -446,6 +496,27 @@ def test_active_pause_skips_posting_orders(tmp_path):
     assert market_state.pending_orders == []
 
 
+def test_pre_post_move_guard_skips_post_when_fair_moves():
+    market_state = _market_state()
+    client = FakeClient(
+        books={"yes": _book(bid="0.53", ask="0.55")},
+        post_responses=[_post_response(True, "posted")],
+    )
+
+    post_quote_plan(
+        client,
+        _plan(buy_band=_buy_band()),
+        parse_args(["--max-pre-post-move-ticks", "2"]),
+        market_state,
+        client,
+    )
+
+    assert client.get_book_tokens == ["yes"]
+    assert len(client.created_orders) == 1
+    assert client.posted_orders == []
+    assert market_state.pending_orders == []
+
+
 def test_preflight_risk_audit_cancels_and_pauses_on_market_breach(tmp_path):
     pause_path = tmp_path / "paused.json"
     open_buy = _open_order("open-buy", BUY, "0.49", "5")
@@ -545,7 +616,7 @@ def test_preflight_snapshot_rejects_market_key_mismatch():
         raise AssertionError("mismatched preflight snapshot should fail")
 
 
-def test_quote_market_reuses_preflight_snapshot_without_refetching_book():
+def test_quote_market_reuses_preflight_snapshot_before_pre_post_refresh():
     market_state = _market_state()
     snapshot = PreflightMarketSnapshot(
         market_key="market",
@@ -561,11 +632,14 @@ def test_quote_market_reuses_preflight_snapshot_without_refetching_book():
         ],
         market_state=market_state,
     )
-    client = FakeClient(post_responses=[_post_response(True, "posted")])
+    client = FakeClient(
+        books={"yes": _book()},
+        post_responses=[_post_response(True, "posted")],
+    )
 
     quote_market(client, client, _market(), parse_args([]), snapshot)
 
-    assert client.get_book_tokens == []
+    assert client.get_book_tokens == ["yes"]
     assert len(client.created_orders) == 1
     assert len(client.posted_orders) == 1
 
@@ -710,9 +784,21 @@ def _market():
     }
 
 
-def _book():
+def _live_args():
+    return [
+        "--live",
+        "--private-key",
+        "0xabc",
+        "--deposit-wallet",
+        "0xdef",
+        "--chain-id",
+        "137",
+    ]
+
+
+def _book(bid="0.49", ask="0.51"):
     return OrderBookSummary(
-        bids=[OrderSummary(price="0.49", size="10")],
-        asks=[OrderSummary(price="0.51", size="10")],
+        bids=[OrderSummary(price=bid, size="10")],
+        asks=[OrderSummary(price=ask, size="10")],
         tick_size="0.01",
     )

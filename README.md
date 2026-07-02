@@ -207,6 +207,12 @@ emergency cancel target.
   In live mode, when --require-two-sided-live is enabled, skip tokens when
   best ask minus best bid is wider than this many ticks.
 
+  --max-pre-post-move-ticks / MARKET_MAKER_MAX_PRE_POST_MOVE_TICKS
+  Default: 2.
+  Live-mode posting guard. Immediately before posting new orders, refresh the
+  token book and skip the post if fair value moved by more than this many ticks
+  from the planned fair value.
+
   --min-top-depth / MARKET_MAKER_MIN_TOP_DEPTH
   Default: 5.
   In live mode, when --require-two-sided-live is enabled, skip tokens unless

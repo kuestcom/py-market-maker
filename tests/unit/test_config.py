@@ -51,6 +51,14 @@ def test_zero_max_book_spread_is_rejected(capsys):
     assert "MARKET_MAKER_MAX_BOOK_SPREAD_TICKS must be greater than zero" in captured.err
 
 
+def test_zero_pre_post_move_limit_is_rejected(capsys):
+    with pytest.raises(SystemExit):
+        parse_args(["--max-pre-post-move-ticks", "0"])
+
+    captured = capsys.readouterr()
+    assert "MARKET_MAKER_MAX_PRE_POST_MOVE_TICKS must be greater than zero" in captured.err
+
+
 def test_negative_top_depth_is_rejected(capsys):
     with pytest.raises(SystemExit):
         parse_args(["--min-top-depth", "-1"])
