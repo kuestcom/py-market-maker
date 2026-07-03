@@ -77,7 +77,8 @@ Live mode runs a preflight risk audit on the selected market scope before
 quoting. It fetches current books, balances, and open orders; skips the cycle
 if those inputs cannot be fetched, are stale, or already breach configured risk
 caps. Before posting live orders, the bot blocks quotes whose simulated fill
-would exceed the configured market loss cap. By default, live mode also
+would exceed configured market loss, market collateral, total collateral, free
+collateral, price-range, or open-order caps. By default, live mode also
 requires a two-sided book with acceptable spread and top-of-book depth before
 quoting. After cancel requests, live mode refreshes open orders before posting
 replacements; after post responses, it only counts accepted orders as pending
@@ -87,9 +88,10 @@ the persisted fill ledger cannot explain the live token balance within the
 configured position tolerance, live mode skips quoting that market for the
 cycle. Buy-side sizing is inventory-aware: token balances, live open buys, and
 pending buys are counted before adding more long exposure to an outcome or
-market. When current state already breaches inventory or market-loss caps, the
-bot skips new quotes and can optionally cancel resting buy orders. It can also
-write a pause file so later cycles or restarts stop before discovery.
+market. When current state already breaches inventory, collateral, or
+market-loss caps, the bot skips new quotes and can optionally cancel resting
+buy orders. It can also write a pause file so later cycles or restarts stop
+before discovery.
 
 By default live mode only posts buy orders.
 
@@ -127,43 +129,73 @@ emergency cancel target.
 ## CLI args / env vars
 
 ```md
+
   --clob-host / KUEST_CLOB_HOST
   Default: https://clob.kuest.com
+  The CLOB API endpoint. Necessary because market discovery, order books,
+  auth, signing metadata, and order posting all go through the CLOB API.
+  Keep configurable for prod/staging/forks.
 
   --live / MARKET_MAKER_LIVE
   Default: false
+  Safety switch. Without it, the bot only prints intended quotes. Necessary
+  because this bot can place real orders.
 
   --private-key / KUEST_PRIVATE_KEY
   Required only with --live.
+  Wallet private key used by the SDK to authenticate and sign orders.
+  Necessary because CLOB orders still need client-side signatures.
 
   --deposit-wallet / KUEST_DEPOSIT_WALLET
   Required only with --live.
+  The deposit wallet/funder address whose balances are used. Necessary
+  because Kuest’s order flow uses deposit-wallet signature type, and the
+  exchange checks this wallet’s USDC/outcome-token balances.
 
   --chain-id / KUEST_CHAIN_ID
   Required only with --live.
-  Allowed: 137 Polygon, 80002 Amoy.
+  Allowed: 137 Polygon, 80002 Amoy. Necessary so signatures are made for
+  the correct chain and verifying contracts.
 
   --discovery / MARKET_MAKER_DISCOVERY
   Default: auto. Values: auto, sampling, site.
+  Controls where markets come from. sampling prefers reward/sampling
+  markets, site uses broader fork-site active markets, auto tries sampling
+  first then falls back. Necessary because “new markets from the fork site”
+  and “markets worth quoting” are not always the same set.
 
   --event-slug / MARKET_MAKER_EVENT_SLUG
-  Optional. When set, trade only markets under this event slug from
+  Optional.
+  If set, the bot ignores normal discovery and keeps trading only the markets
+  under this event slug. It resolves markets from the Kuest fork configured in
   .sdk/site-config.json.
 
   --max-markets / MARKET_MAKER_MAX_MARKETS
   Default: 3.
+  Maximum markets to quote per cycle. Necessary risk control: every market
+  can produce multiple token quotes and real capital exposure.
 
   --max-pages / MARKET_MAKER_MAX_PAGES
   Default: 5.
+  How many paginated market pages to scan. Necessary to cap API work and
+  avoid sweeping the whole venue every cycle.
 
   --order-size / MARKET_MAKER_ORDER_SIZE
   Default: 5.
+  Default share size per order and fallback band size. Necessary because every
+  order needs a size. For buys, this controls exposure; for sells, it requires
+  that many shares of that outcome token.
 
   --edge-ticks / MARKET_MAKER_EDGE_TICKS
   Default: 1.
+  Minimum distance from estimated fair value, in ticks. Necessary so the
+  bot does not quote exactly at fair or cross into negative edge just to
+  get filled.
 
   --min-spread-ticks / MARKET_MAKER_MIN_SPREAD_TICKS
   Default: 2.
+  Minimum spread between the bot’s buy and sell quotes, in ticks. Necessary
+  to avoid placing a too-tight two-sided market.
 
   --band-min-margin-ticks / MARKET_MAKER_BAND_MIN_MARGIN_TICKS
   Optional. Default: --edge-ticks.
@@ -191,73 +223,64 @@ emergency cancel target.
   Optional. Default: max(band avg size, band min size).
   Maximum total open size allowed inside the active side band before trimming.
 
-  --max-loss-per-market / MARKET_MAKER_MAX_LOSS_PER_MARKET
-  Default: 25.
-  Maximum simulated worst-case market loss allowed after existing balances,
-  open orders, and the proposed new order are counted. Existing balances are
-  valued at realized cost basis from the persisted fill ledger; live quoting is
-  skipped when the ledger and live balance do not reconcile.
-
-  --max-inventory-per-token / MARKET_MAKER_MAX_INVENTORY_PER_TOKEN
-  Default: 25.
-  Maximum long outcome-token inventory allowed after balances, live open buys,
-  pending buys, and staged buys are counted.
-
-  --max-inventory-per-market / MARKET_MAKER_MAX_INVENTORY_PER_MARKET
-  Default: 50.
-  Maximum total long inventory across a market's outcome tokens.
-
   --max-book-spread-ticks / MARKET_MAKER_MAX_BOOK_SPREAD_TICKS
   Default: 20.
   In live mode, when --require-two-sided-live is enabled, skip tokens when
-  best ask minus best bid is wider than this many ticks.
+  best ask minus best bid is wider than this many ticks. Necessary because
+  midpoint fair value is unreliable in wide books.
 
   --max-pre-post-move-ticks / MARKET_MAKER_MAX_PRE_POST_MOVE_TICKS
   Default: 2.
   Live-mode posting guard. Immediately before posting new orders, refresh the
-  token book and skip the post if fair value moved by more than this many ticks
-  from the planned fair value.
+  token book and skip the post if fair value moved by more than this many
+  ticks from the planned fair value.
 
   --min-top-depth / MARKET_MAKER_MIN_TOP_DEPTH
   Default: 5.
   In live mode, when --require-two-sided-live is enabled, skip tokens unless
   both best bid and best ask have at least this much size at the top level.
-
-  --require-two-sided-live / MARKET_MAKER_REQUIRE_TWO_SIDED_LIVE
-  Default: true.
-  In live mode, require a valid two-sided book before quoting.
-
-  --max-data-age-secs / MARKET_MAKER_MAX_DATA_AGE_SECS
-  Default: 10.
-  Live-mode freshness limit for order books, token balances, and open orders.
+  Necessary because tiny top levels can make the visible midpoint too easy
+  to manipulate.
 
   --quote-sides / MARKET_MAKER_QUOTE_SIDES
   Default: buy. Values: buy, sell, both.
+  Controls whether the bot places bids, asks, or both. Necessary because
+  buys need USDC, while sells need existing outcome-token inventory. Fresh
+  wallets should use buy.
 
   --allow-single-sided / MARKET_MAKER_ALLOW_SINGLE_SIDED
   Default: true.
+  Allows quoting only one side if the other side is unsafe or disabled.
+  Necessary because many books/edge settings produce only one valid side.
 
   --respect-reward-min-size / MARKET_MAKER_RESPECT_REWARD_MIN_SIZE
   Default: false.
+  If true, order size is raised to the market reward minimum size.
+  Necessary only if you are trying to satisfy reward/scoring constraints;
+  otherwise it can unexpectedly increase exposure.
 
   --cancel-before-quote / MARKET_MAKER_CANCEL_BEFORE_QUOTE
   Default: true.
+  Cancels your existing orders for the token before posting fresh quotes.
+  Necessary to avoid stacking duplicate stale orders on the same token.
 
   --cancel-all / MARKET_MAKER_CANCEL_ALL
   Default: false.
-  In live mode, cancel open orders in the currently configured market scope and
-  exit.
+  Live-only one-shot command. Discovers the configured market scope, cancels
+  open orders for its outcome tokens, waits briefly for them to clear, then
+  exits. Necessary for emergency cleanup without posting new quotes.
 
   --cancel-all-on-exit / MARKET_MAKER_CANCEL_ALL_ON_EXIT
   Default: false.
-  In live mode, cancel open orders in the latest non-empty managed market scope
-  when the process is interrupted.
+  Live-only shutdown guard. On Ctrl-C or SIGTERM, cancels open orders for the
+  markets currently managed by this process and verifies whether any remain.
+  Necessary when you do not want interrupted runs to leave stale GTC orders.
 
   --cancel-on-risk-breach / MARKET_MAKER_CANCEL_ON_RISK_BREACH
   Default: false.
   Live-only circuit-breaker action. When current state already breaches
-  inventory or market-loss caps, skip new quotes and cancel resting buy orders
-  for the breached token.
+  inventory, market-loss, or market-collateral caps, skip new quotes and cancel
+  resting buy orders for the breached token.
 
   --pause-on-risk-breach / MARKET_MAKER_PAUSE_ON_RISK_BREACH
   Default: false.
@@ -277,18 +300,79 @@ emergency cancel target.
 
   --post-only / MARKET_MAKER_POST_ONLY
   Default: true.
+  Tells the CLOB to reject orders that would immediately take liquidity.
+  Necessary for a market-maker posture: rest orders, do not cross.
+
+  --require-two-sided-live / MARKET_MAKER_REQUIRE_TWO_SIDED_LIVE
+  Default: true.
+  In live mode, skip tokens without a reliable bid and ask. Necessary because
+  fallback prices like 0.5 are not safe enough for real money.
+
+  --min-price / MARKET_MAKER_MIN_PRICE
+  Default: 0.05.
+  Lower bound for posted quote prices. Necessary to avoid extreme tail prices
+  where one bad fill can dominate the small edge.
+
+  --max-price / MARKET_MAKER_MAX_PRICE
+  Default: 0.95.
+  Upper bound for posted quote prices. Same risk control as --min-price.
+
+  --max-collateral-per-market / MARKET_MAKER_MAX_COLLATERAL_PER_MARKET
+  Default: 25.
+  Maximum collateral exposure counted for one market in a cycle.
+
+  --max-loss-per-market / MARKET_MAKER_MAX_LOSS_PER_MARKET
+  Default: 25.
+  Maximum simulated worst-case market loss allowed after existing balances,
+  open orders, and the proposed new order are counted. Necessary because
+  collateral caps alone do not account for cross-outcome inventory. Existing
+  balances are valued at realized cost basis from the persisted fill ledger;
+  live quoting is skipped when the ledger and live balance do not reconcile.
+
+  --max-inventory-per-token / MARKET_MAKER_MAX_INVENTORY_PER_TOKEN
+  Default: 25.
+  Maximum long outcome-token inventory allowed after balances, live open
+  orders, and pending orders are counted. Buy orders are capped or skipped when
+  this limit leaves too little room.
+
+  --max-inventory-per-market / MARKET_MAKER_MAX_INVENTORY_PER_MARKET
+  Default: 50.
+  Maximum total long inventory across a market's outcome tokens. Necessary to
+  stop the bot from accumulating too many shares in one market even when each
+  individual token is under its own cap.
+
+  --max-total-collateral / MARKET_MAKER_MAX_TOTAL_COLLATERAL
+  Default: 50.
+  Maximum collateral exposure counted across all markets in a cycle.
+
+  --min-free-collateral / MARKET_MAKER_MIN_FREE_COLLATERAL
+  Default: 1.
+  Collateral buffer left unused after subtracting open buy orders.
+
+  --max-data-age-secs / MARKET_MAKER_MAX_DATA_AGE_SECS
+  Default: 10.
+  Live-mode freshness limit for order books, open orders, token balances, and
+  collateral balance. Necessary because stale inputs can produce duplicate or
+  mis-sized quotes.
+
+  --max-open-orders-per-token / MARKET_MAKER_MAX_OPEN_ORDERS_PER_TOKEN
+  Default: 2.
+  Caps live open orders per token after reconciliation.
 
   --discover-only / MARKET_MAKER_DISCOVER_ONLY
   Default: false.
+  Only prints discovered markets, no book reads or quotes. Necessary for
+  debugging market selection safely.
 
   --cycles / MARKET_MAKER_CYCLES
   Default: 1.
+  Number of discovery/quote loops to run. Necessary to choose between one-
+  shot testing and repeated quoting.
 
   --refresh-secs / MARKET_MAKER_REFRESH_SECS
   Default: 30.
-
-  --state-path / MARKET_MAKER_STATE_PATH
-  Default: state/seen-markets.json.
+  Sleep between cycles. Necessary when --cycles > 1, so the bot does not
+  hammer APIs or churn orders too fast.
 
   --fill-state-path / MARKET_MAKER_FILL_STATE_PATH
   Default: state/fills.json.

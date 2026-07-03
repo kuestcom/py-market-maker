@@ -238,6 +238,18 @@ def test_preflight_stale_data_reason_flags_stale_token_inputs():
     assert "token yes open orders" in reason
 
 
+def test_configured_price_range_can_skip_quote_plan():
+    quote = bot.build_token_quote(
+        _market(),
+        {"token_id": "yes", "outcome": "Yes", "price": "0.50"},
+        _book(),
+        bot.time.monotonic(),
+        parse_args(["--min-price", "0.55"]),
+    )
+
+    assert quote.plan is None
+
+
 def test_inventory_adjusted_buy_size_caps_to_remaining_room():
     assert inventory_adjusted_buy_size(Decimal("5"), Decimal("1"), Decimal("3")) == Decimal("3")
 
@@ -506,6 +518,19 @@ def test_risk_breaches_detect_market_loss_over_limit():
     )
 
 
+def test_risk_breaches_detect_market_collateral_over_limit():
+    open_buy = _open_order("open-buy", BUY, "0.50", "10")
+    market_state = _market_state(open_orders=[open_buy])
+    breaches = market_state.risk_breaches(parse_args(["--max-collateral-per-market", "4"]))
+
+    assert any(
+        breach.kind == "market_collateral"
+        and breach.value == Decimal("5.00")
+        and breach.limit == Decimal("4")
+        for breach in breaches
+    )
+
+
 def test_risk_breach_skips_new_quotes_without_canceling_by_default():
     open_buy = _open_order("open-buy", BUY, "0.49", "5")
     market_state = _market_state(open_orders=[open_buy], balance=Decimal("11"))
@@ -675,6 +700,43 @@ def test_pre_post_move_guard_skips_post_when_fair_moves():
     assert market_state.pending_orders == []
 
 
+def test_buy_is_skipped_when_collateral_budget_is_too_small():
+    market_state = _market_state()
+    client = FakeClient(
+        collateral_balance=Decimal("1"),
+        post_responses=[_post_response(True, "posted")],
+    )
+
+    post_quote_plan(
+        client,
+        _plan(buy_band=_buy_band()),
+        parse_args(["--min-free-collateral", "1"]),
+        market_state,
+    )
+
+    assert client.created_orders == []
+    assert client.posted_orders == []
+    assert market_state.pending_orders == []
+
+
+def test_max_open_orders_per_token_trims_extra_kept_orders_before_posting():
+    older = _open_order("older", BUY, "0.49", "5", "2026-01-01T00:00:00+00:00")
+    newer = _open_order("newer", BUY, "0.49", "5", "2026-01-01T00:00:01+00:00")
+    market_state = _market_state(open_orders=[older, newer])
+    client = FakeClient(open_order_pages={"yes": [[older]]})
+
+    post_quote_plan(
+        client,
+        _plan(buy_band=_buy_band(avg_size=Decimal("10"))),
+        parse_args(["--max-open-orders-per-token", "1"]),
+        market_state,
+    )
+
+    assert client.cancel_batches == [["newer"]]
+    assert client.created_orders == []
+    assert market_state.open_orders("yes") == [older]
+
+
 def test_preflight_risk_audit_cancels_and_pauses_on_market_breach(tmp_path):
     pause_path = tmp_path / "paused.json"
     open_buy = _open_order("open-buy", BUY, "0.49", "5")
@@ -771,6 +833,37 @@ def test_preflight_risk_audit_returns_market_snapshots():
     assert result.snapshots[0].market_state.token_state("yes").balance == Decimal("1")
 
 
+def test_preflight_risk_audit_stops_when_total_open_buy_collateral_breaches(tmp_path):
+    open_buy_a = _open_order("open-buy-a", BUY, "0.80", "40")
+    open_buy_b = _open_order("open-buy-b", BUY, "0.80", "40")
+    client = FakeClient(
+        books={"yes": _book()},
+        open_order_pages={"yes": [[open_buy_a], [open_buy_b]]},
+    )
+
+    result = preflight_risk_audit(
+        client,
+        client,
+        [_market("market-a"), _market("market-b")],
+        parse_args([
+            "--max-loss-per-market",
+            "100",
+            "--max-collateral-per-market",
+            "100",
+            "--max-inventory-per-token",
+            "100",
+            "--max-inventory-per-market",
+            "200",
+            "--max-total-collateral",
+            "50",
+            "--fill-state-path",
+            str(tmp_path / "fills.json"),
+        ]),
+    )
+
+    assert result.result == PreflightRiskAuditResult.STOP
+
+
 def test_preflight_snapshot_rejects_market_key_mismatch():
     snapshot = PreflightMarketSnapshot(
         market_key="market-a",
@@ -815,7 +908,15 @@ def test_quote_market_reuses_preflight_snapshot_before_pre_post_refresh():
 
 
 class FakeClient:
-    def __init__(self, open_order_pages=None, post_responses=None, books=None, balances=None, trade_pages=None):
+    def __init__(
+        self,
+        open_order_pages=None,
+        post_responses=None,
+        books=None,
+        balances=None,
+        trade_pages=None,
+        collateral_balance=Decimal("100"),
+    ):
         self.open_order_pages = {
             token_id: list(pages)
             for token_id, pages in (open_order_pages or {}).items()
@@ -823,6 +924,7 @@ class FakeClient:
         self.post_responses = list(post_responses or [])
         self.books = dict(books or {})
         self.balances = dict(balances or {})
+        self.collateral_balance = collateral_balance
         self.trade_pages = {
             token_id: list(pages)
             for token_id, pages in (trade_pages or {}).items()
@@ -839,6 +941,8 @@ class FakeClient:
         return self.books[token_id]
 
     def get_balance_allowance(self, params):
+        if params.asset_type == bot.AssetType.COLLATERAL:
+            return {"balance": str(self.collateral_balance * bot.CONDITIONAL_TOKEN_BASE_UNITS)}
         balance = self.balances.get(params.token_id, Decimal("0"))
         return {"balance": str(balance * bot.CONDITIONAL_TOKEN_BASE_UNITS)}
 
@@ -941,7 +1045,7 @@ def _sell_band(avg_size=Decimal("10")):
     )
 
 
-def _open_order(order_id, side, price, size):
+def _open_order(order_id, side, price, size, created_at=None):
     return {
         "id": order_id,
         "asset_id": "yes",
@@ -949,6 +1053,7 @@ def _open_order(order_id, side, price, size):
         "price": price,
         "original_size": size,
         "size_matched": "0",
+        **({"created_at": created_at} if created_at is not None else {}),
     }
 
 
@@ -973,9 +1078,9 @@ def _post_response(success, order_id):
     }
 
 
-def _market():
+def _market(slug="market"):
     return {
-        "slug": "market",
+        "slug": slug,
         "question": "Question?",
         "enable_order_book": True,
         "active": True,

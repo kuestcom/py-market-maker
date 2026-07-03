@@ -50,6 +50,9 @@ class MarketExposure:
             )
         return max(cost - proceeds - worst_resolution_payout, Decimal("0"))
 
+    def buy_collateral(self) -> Decimal:
+        return sum((outcome.cost for outcome in self.outcomes), Decimal("0"))
+
     def projected_loss(self, order: ProposedOrder) -> Decimal:
         exposure = MarketExposure(
             outcomes=[

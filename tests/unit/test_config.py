@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 import pytest
 
 from py_market_maker.config import parse_args
@@ -25,6 +27,70 @@ def test_zero_market_loss_limit_is_rejected(capsys):
 
     captured = capsys.readouterr()
     assert "MARKET_MAKER_MAX_LOSS_PER_MARKET must be greater than zero" in captured.err
+
+
+def test_rust_parity_risk_defaults_are_configurable():
+    config = parse_args([
+        "--min-price",
+        "0.10",
+        "--max-price",
+        "0.90",
+        "--max-collateral-per-market",
+        "11",
+        "--max-total-collateral",
+        "22",
+        "--min-free-collateral",
+        "3",
+        "--max-open-orders-per-token",
+        "4",
+    ])
+
+    assert config.min_price == Decimal("0.10")
+    assert config.max_price == Decimal("0.90")
+    assert config.max_collateral_per_market == Decimal("11")
+    assert config.max_total_collateral == Decimal("22")
+    assert config.min_free_collateral == Decimal("3")
+    assert config.max_open_orders_per_token == 4
+
+
+def test_invalid_configured_price_range_is_rejected(capsys):
+    with pytest.raises(SystemExit):
+        parse_args(["--min-price", "0", "--max-price", "0.95"])
+
+    captured = capsys.readouterr()
+    assert "MARKET_MAKER_MIN_PRICE must be between 0 and 1" in captured.err
+
+    with pytest.raises(SystemExit):
+        parse_args(["--min-price", "0.95", "--max-price", "0.95"])
+
+    captured = capsys.readouterr()
+    assert "MARKET_MAKER_MIN_PRICE must be less than MARKET_MAKER_MAX_PRICE" in captured.err
+
+
+def test_invalid_collateral_and_open_order_limits_are_rejected(capsys):
+    with pytest.raises(SystemExit):
+        parse_args(["--max-collateral-per-market", "0"])
+
+    captured = capsys.readouterr()
+    assert "MARKET_MAKER_MAX_COLLATERAL_PER_MARKET must be greater than zero" in captured.err
+
+    with pytest.raises(SystemExit):
+        parse_args(["--max-total-collateral", "0"])
+
+    captured = capsys.readouterr()
+    assert "MARKET_MAKER_MAX_TOTAL_COLLATERAL must be greater than zero" in captured.err
+
+    with pytest.raises(SystemExit):
+        parse_args(["--min-free-collateral", "-1"])
+
+    captured = capsys.readouterr()
+    assert "MARKET_MAKER_MIN_FREE_COLLATERAL cannot be negative" in captured.err
+
+    with pytest.raises(SystemExit):
+        parse_args(["--max-open-orders-per-token", "0"])
+
+    captured = capsys.readouterr()
+    assert "MARKET_MAKER_MAX_OPEN_ORDERS_PER_TOKEN must be greater than zero" in captured.err
 
 
 def test_zero_token_inventory_limit_is_rejected(capsys):
