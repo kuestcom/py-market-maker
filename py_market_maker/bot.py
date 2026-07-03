@@ -125,6 +125,7 @@ class PreflightMarketSnapshot:
 class PreflightRiskAudit:
     result: PreflightRiskAuditResult
     snapshots: list[PreflightMarketSnapshot]
+    risk_budget: "RiskBudget | None" = None
 
 
 @dataclass(frozen=True)
@@ -139,6 +140,7 @@ class SubmittedOrder:
     side: str
     proposed_order: ProposedOrder
     order: Any
+    collateral: Decimal = Decimal("0")
 
 
 @dataclass(frozen=True)
@@ -146,6 +148,48 @@ class InventoryBuyRoom:
     token_position: Decimal
     market_inventory: Decimal
     room: Decimal
+
+
+@dataclass
+class RiskBudget:
+    remaining_collateral: Decimal
+    counted_open_buy_orders: dict[str, Decimal]
+
+    @classmethod
+    def new(cls, collateral_limit: Decimal) -> "RiskBudget":
+        return cls(
+            remaining_collateral=max(collateral_limit, Decimal("0")),
+            counted_open_buy_orders={},
+        )
+
+    def remaining(self) -> Decimal:
+        return max(self.remaining_collateral, Decimal("0"))
+
+    def reserved_collateral(self) -> Decimal:
+        return sum(self.counted_open_buy_orders.values(), Decimal("0"))
+
+    def reserve_open_buy_order(self, order: Any) -> None:
+        if _response_field(order, "side") != BUY:
+            return
+        order_id = open_order_id(order)
+        if not order_id or order_id in self.counted_open_buy_orders:
+            return
+        collateral = open_order_remaining_size(order) * _decimal(_response_field(order, "price"), Decimal("0"))
+        self.counted_open_buy_orders[order_id] = collateral
+        self.remaining_collateral = max(self.remaining_collateral - collateral, Decimal("0"))
+
+    def release_open_buy_order(self, order: Any) -> None:
+        if _response_field(order, "side") != BUY:
+            return
+        order_id = open_order_id(order)
+        collateral = self.counted_open_buy_orders.pop(order_id, None)
+        if collateral is not None:
+            self.remaining_collateral += collateral
+
+    def reserve_new_collateral(self, collateral: Decimal) -> Decimal:
+        reserved = min(max(collateral, Decimal("0")), self.remaining())
+        self.remaining_collateral = max(self.remaining_collateral - reserved, Decimal("0"))
+        return reserved
 
 
 @dataclass(frozen=True)
@@ -162,6 +206,8 @@ class RiskBreach:
             return f"market inventory {self.value} exceeds limit {self.limit}"
         if self.kind == "market_loss":
             return f"market loss {self.value} exceeds limit {self.limit}"
+        if self.kind == "market_collateral":
+            return f"market buy collateral {self.value} exceeds limit {self.limit}"
         return f"{self.kind} {self.value} exceeds limit {self.limit}"
 
 
@@ -436,6 +482,16 @@ class LiveMarketState:
                 )
             )
 
+        collateral = self.exposure().buy_collateral()
+        if collateral > config.max_collateral_per_market:
+            breaches.append(
+                RiskBreach(
+                    kind="market_collateral",
+                    value=collateral,
+                    limit=config.max_collateral_per_market,
+                )
+            )
+
         return breaches
 
 
@@ -523,6 +579,7 @@ def run_cycles(
             continue
 
         preflight_snapshots: deque[PreflightMarketSnapshot] = deque()
+        global_budget = RiskBudget.new(config.max_total_collateral)
         if live_client is not None:
             preflight = preflight_risk_audit(
                 public_client,
@@ -537,6 +594,7 @@ def run_cycles(
             if preflight.result == PreflightRiskAuditResult.STOP:
                 return
             preflight_snapshots = deque(preflight.snapshots)
+            global_budget = preflight.risk_budget or global_budget
 
         for candidate in candidates:
             preflight_snapshot = None
@@ -544,7 +602,7 @@ def run_cycles(
                 if not preflight_snapshots:
                     raise RuntimeError("missing preflight snapshot for live quote")
                 preflight_snapshot = preflight_snapshots.popleft()
-            quote_market(public_client, live_client, candidate.market, config, preflight_snapshot)
+            quote_market(public_client, live_client, candidate.market, config, preflight_snapshot, global_budget)
             if stop_if_paused(config):
                 return
 
@@ -716,7 +774,11 @@ def quote_market(
     market: dict[str, Any],
     config: Config,
     preflight_snapshot: PreflightMarketSnapshot | None = None,
+    global_budget: RiskBudget | None = None,
 ) -> None:
+    if global_budget is None:
+        global_budget = RiskBudget.new(config.max_total_collateral)
+    market_budget = RiskBudget.new(config.max_collateral_per_market)
     snapshot = preflight_snapshot_for_market(preflight_snapshot, market_key(market))
     if snapshot is not None:
         token_quotes = snapshot.token_quotes
@@ -754,7 +816,15 @@ def quote_market(
         if stop_if_paused(config):
             return
         if token_quote.plan is not None:
-            post_quote_plan(live_client, token_quote.plan, config, market_state, public_client)
+            post_quote_plan(
+                live_client,
+                token_quote.plan,
+                config,
+                market_state,
+                public_client,
+                global_budget,
+                market_budget,
+            )
             if stop_if_paused(config):
                 return
 
@@ -766,32 +836,38 @@ def preflight_risk_audit(
     config: Config,
 ) -> PreflightRiskAudit:
     if not markets:
-        return PreflightRiskAudit(PreflightRiskAuditResult.CONTINUE, [])
+        return PreflightRiskAudit(
+            PreflightRiskAuditResult.CONTINUE,
+            [],
+            RiskBudget.new(config.max_total_collateral),
+        )
 
     print(f"preflight risk audit: checking {len(markets)} markets")
     snapshots: list[PreflightMarketSnapshot] = []
+    global_budget = RiskBudget.new(config.max_total_collateral)
+    scanned_markets: list[tuple[dict[str, Any], LiveMarketState]] = []
     for market in markets:
         pause = PauseState.load(config.pause_path)
         if pause is not None:
             print(f"preflight risk audit stopped by {config.pause_path}: {pause.reason.strip()}")
-            return PreflightRiskAudit(PreflightRiskAuditResult.STOP, snapshots)
+            return PreflightRiskAudit(PreflightRiskAuditResult.STOP, snapshots, global_budget)
 
         try:
             token_quotes = build_market_token_quotes(public_client, market, config)
         except Exception as error:
             print(f"preflight risk audit skip {_market_slug(market)}: failed to fetch order books ({error})")
-            return PreflightRiskAudit(PreflightRiskAuditResult.SKIP_CYCLE, snapshots)
+            return PreflightRiskAudit(PreflightRiskAuditResult.SKIP_CYCLE, snapshots, global_budget)
 
         try:
             market_state = LiveMarketState.load(live_client, token_quotes, config)
         except Exception as error:
             print(f"preflight risk audit skip {_market_slug(market)}: failed to fetch live state ({error})")
-            return PreflightRiskAudit(PreflightRiskAuditResult.SKIP_CYCLE, snapshots)
+            return PreflightRiskAudit(PreflightRiskAuditResult.SKIP_CYCLE, snapshots, global_budget)
 
         stale_reason = preflight_stale_data_reason(token_quotes, market_state, time.monotonic(), config)
         if stale_reason is not None:
             print(f"preflight risk audit skip {_market_slug(market)}: stale live data ({stale_reason})")
-            return PreflightRiskAudit(PreflightRiskAuditResult.SKIP_CYCLE, snapshots)
+            return PreflightRiskAudit(PreflightRiskAuditResult.SKIP_CYCLE, snapshots, global_budget)
 
         breaches = market_state.risk_breaches(config)
         if breaches:
@@ -802,8 +878,8 @@ def preflight_risk_audit(
                 reason = preflight_breach_pause_reason(market, breaches)
                 PauseState.save_reason(config.pause_path, reason)
                 print(f"wrote pause file {config.pause_path}: {reason}")
-                return PreflightRiskAudit(PreflightRiskAuditResult.STOP, snapshots)
-            return PreflightRiskAudit(PreflightRiskAuditResult.SKIP_CYCLE, snapshots)
+                return PreflightRiskAudit(PreflightRiskAuditResult.STOP, snapshots, global_budget)
+            return PreflightRiskAudit(PreflightRiskAuditResult.SKIP_CYCLE, snapshots, global_budget)
 
         position_reason = market_state.position_reconcile_reject_reason()
         if position_reason is not None:
@@ -811,7 +887,12 @@ def preflight_risk_audit(
                 f"preflight risk audit skip {_market_slug(market)}: "
                 f"position reconciliation failed ({position_reason})"
             )
-            return PreflightRiskAudit(PreflightRiskAuditResult.SKIP_CYCLE, snapshots)
+            return PreflightRiskAudit(PreflightRiskAuditResult.SKIP_CYCLE, snapshots, global_budget)
+
+        scanned_markets.append((market, market_state))
+        for token_state in market_state.tokens:
+            for order in token_state.open_orders:
+                global_budget.reserve_open_buy_order(order)
 
         snapshots.append(
             PreflightMarketSnapshot(
@@ -821,7 +902,25 @@ def preflight_risk_audit(
             )
         )
 
-    return PreflightRiskAudit(PreflightRiskAuditResult.CONTINUE, snapshots)
+    used_collateral = global_budget.reserved_collateral()
+    if used_collateral > config.max_total_collateral:
+        print(
+            f"preflight risk breach: total open buy collateral {used_collateral} "
+            f"exceeds limit {config.max_total_collateral}"
+        )
+        if config.cancel_on_risk_breach:
+            for market, market_state in scanned_markets:
+                cancel_risk_increasing_market_orders(live_client, market, config, market_state)
+        if config.pause_on_risk_breach:
+            reason = (
+                f"preflight risk breach: total open buy collateral {used_collateral} "
+                f"exceeds limit {config.max_total_collateral}"
+            )
+            PauseState.save_reason(config.pause_path, reason)
+            print(f"wrote pause file {config.pause_path}: {reason}")
+        return PreflightRiskAudit(PreflightRiskAuditResult.STOP, snapshots, global_budget)
+
+    return PreflightRiskAudit(PreflightRiskAuditResult.CONTINUE, snapshots, global_budget)
 
 
 def preflight_snapshot_for_market(
@@ -964,9 +1063,11 @@ def build_quote_band(
     else:
         return None
 
-    min_price = max(min_price, tick)
-    max_price = min(max_price, Decimal("1") - tick)
-    if not is_tradeable_price(price, tick) or min_price > max_price:
+    min_price = max(min_price, tick, config.min_price)
+    max_price = min(max_price, Decimal("1") - tick, config.max_price)
+    if not is_tradeable_price(price, tick) or not (config.min_price <= price <= config.max_price):
+        return None
+    if min_price > max_price:
         return None
 
     return QuoteBand(
@@ -1083,7 +1184,13 @@ def post_quote_plan(
     config: Config,
     market_state: LiveMarketState,
     public_client: ClobClient | None = None,
+    global_budget: RiskBudget | None = None,
+    market_budget: RiskBudget | None = None,
 ) -> None:
+    if global_budget is None:
+        global_budget = RiskBudget.new(config.max_total_collateral)
+    if market_budget is None:
+        market_budget = RiskBudget.new(config.max_collateral_per_market)
     open_orders = market_state.open_orders(plan.token_id)
     stale_reason = stale_live_data_reason(plan, market_state, time.monotonic(), config)
     if stale_reason is not None:
@@ -1095,7 +1202,7 @@ def post_quote_plan(
         return
 
     if config.cancel_before_quote:
-        orders_to_cancel = cancellable_orders(open_orders, plan)
+        orders_to_cancel = cancellable_orders(open_orders, plan, config.max_open_orders_per_token)
         order_ids = [open_order_id(order) for order in orders_to_cancel if open_order_id(order)]
         if order_ids and skip_live_action_if_paused(plan, config, "canceling stale orders"):
             return
@@ -1117,11 +1224,17 @@ def post_quote_plan(
             if any(open_order_id(order) in canceled_ids for order in open_orders):
                 print(f"skip placing {plan.market_slug} {plan.outcome}: canceled order state is still unstable")
                 return
+            for order in orders_to_cancel:
+                global_budget.release_open_buy_order(order)
 
     stale_reason = stale_live_data_reason(plan, market_state, time.monotonic(), config)
     if stale_reason is not None:
         print(f"skip placing {plan.market_slug} {plan.outcome}: stale live data ({stale_reason})")
         return
+
+    for order in open_orders:
+        global_budget.reserve_open_buy_order(order)
+        market_budget.reserve_open_buy_order(order)
 
     breaches = market_state.risk_breaches(config)
     if breaches:
@@ -1136,8 +1249,17 @@ def post_quote_plan(
             print(f"wrote pause file {config.pause_path}: {reason}")
         return
 
+    token_state = market_state.token_state(plan.token_id)
+    token_balance = token_state.balance if token_state is not None else Decimal("0")
+    locked_collateral = open_buy_collateral(open_orders)
+    locked_tokens = open_sell_size(open_orders)
+    free_collateral = max(collateral_balance(client) - locked_collateral - config.min_free_collateral, Decimal("0"))
+    free_tokens = max(token_balance - locked_tokens, Decimal("0"))
+    new_order_slots = max(config.max_open_orders_per_token - len(open_orders), 0)
     planned_orders: list[SubmittedOrder] = []
     for band in plan.bands():
+        if new_order_slots <= 0:
+            break
         open_size = band_open_size(open_orders, band)
         missing_size = band_missing_size(band, open_size)
         if missing_size is None:
@@ -1162,6 +1284,30 @@ def post_quote_plan(
                     f"market inventory {inventory_room.market_inventory} / max {config.max_inventory_per_market}"
                 )
             missing_size = adjusted_size
+            collateral = missing_size * band.price
+            affordable_size = affordable_buy_size(
+                missing_size,
+                band.price,
+                free_collateral,
+                global_budget,
+                market_budget,
+            )
+            if affordable_size < missing_size:
+                print(
+                    f"skip {plan.market_slug} {plan.outcome} buy: "
+                    f"risk budget/free collateral leaves size {affordable_size} below band target {missing_size}"
+                )
+                continue
+        else:
+            sell_size = min(missing_size, free_tokens)
+            if sell_size < missing_size:
+                print(
+                    f"skip {plan.market_slug} {plan.outcome} sell: "
+                    f"free token balance leaves size {sell_size} below band target {missing_size}"
+                )
+                continue
+            missing_size = sell_size
+            collateral = Decimal("0")
 
         proposed = ProposedOrder(
             token_id=plan.token_id,
@@ -1179,7 +1325,15 @@ def post_quote_plan(
                 side=band.side,
             )
         )
-        planned_orders.append(SubmittedOrder(side=band.side, proposed_order=proposed, order=order))
+        planned_orders.append(
+            SubmittedOrder(
+                side=band.side,
+                proposed_order=proposed,
+                order=order,
+                collateral=collateral,
+            )
+        )
+        new_order_slots -= 1
 
     if planned_orders and public_client is not None:
         move_reason = pre_post_move_reject_reason(public_client, plan, config)
@@ -1195,10 +1349,14 @@ def post_quote_plan(
         for planned_order in planned_orders
     ]
     print_post_responses(plan, responses)
-    apply_post_responses(client, plan, responses, market_state)
+    apply_post_responses(client, plan, responses, market_state, global_budget, market_budget)
 
 
-def cancellable_orders(open_orders: list[Any], plan: QuotePlan) -> list[Any]:
+def cancellable_orders(
+    open_orders: list[Any],
+    plan: QuotePlan,
+    max_open_orders_per_token: int | None = None,
+) -> list[Any]:
     cancellable: list[Any] = []
     cancellable_ids: set[str] = set()
 
@@ -1230,6 +1388,20 @@ def cancellable_orders(open_orders: list[Any], plan: QuotePlan) -> list[Any]:
             cancellable_ids.add(order_id)
             cancellable.append(order)
             band_amount = max(band_amount - open_order_remaining_size(order), Decimal("0"))
+
+    if max_open_orders_per_token is not None:
+        kept = [
+            order
+            for order in open_orders
+            if open_order_id(order) not in cancellable_ids
+        ]
+        if len(kept) > max_open_orders_per_token:
+            kept.sort(key=open_order_created_at)
+            for order in kept[max_open_orders_per_token:]:
+                order_id = open_order_id(order)
+                if order_id and order_id not in cancellable_ids:
+                    cancellable_ids.add(order_id)
+                    cancellable.append(order)
 
     return cancellable
 
@@ -1265,6 +1437,47 @@ def inventory_adjusted_buy_size(
     if size <= Decimal("0") or size < minimum_size:
         return None
     return size
+
+
+def affordable_buy_size(
+    requested_size: Decimal,
+    price: Decimal,
+    free_collateral: Decimal,
+    global_budget: RiskBudget,
+    market_budget: RiskBudget,
+) -> Decimal:
+    if requested_size <= Decimal("0") or price <= Decimal("0"):
+        return Decimal("0")
+    requested_collateral = requested_size * price
+    affordable_collateral = min(
+        requested_collateral,
+        free_collateral,
+        global_budget.remaining(),
+        market_budget.remaining(),
+    )
+    return affordable_collateral / price
+
+
+def open_buy_collateral(open_orders: list[Any]) -> Decimal:
+    return sum(
+        (
+            open_order_remaining_size(order) * _decimal(_response_field(order, "price"), Decimal("0"))
+            for order in open_orders
+            if _response_field(order, "side") == BUY
+        ),
+        Decimal("0"),
+    )
+
+
+def open_sell_size(open_orders: list[Any]) -> Decimal:
+    return sum(
+        (
+            open_order_remaining_size(order)
+            for order in open_orders
+            if _response_field(order, "side") == SELL
+        ),
+        Decimal("0"),
+    )
 
 
 def token_long_inventory(
@@ -1546,6 +1759,14 @@ def conditional_balance(client: ClobClient, token_id: str) -> Decimal:
     return balance / CONDITIONAL_TOKEN_BASE_UNITS
 
 
+def collateral_balance(client: ClobClient) -> Decimal:
+    response = client.get_balance_allowance(
+        BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+    )
+    balance = _decimal(_response_field(response, "balance"), Decimal("0"))
+    return balance / CONDITIONAL_TOKEN_BASE_UNITS
+
+
 def trades_for_token(
     client: ClobClient,
     token_id: str,
@@ -1766,10 +1987,18 @@ def apply_post_responses(
     plan: QuotePlan,
     responses: list[tuple[SubmittedOrder, Any]],
     market_state: LiveMarketState,
+    global_budget: RiskBudget,
+    market_budget: RiskBudget,
 ) -> None:
     has_failed_response = False
     for submitted_order, response in responses:
-        has_failed_response |= apply_post_response(submitted_order, response, market_state)
+        has_failed_response |= apply_post_response(
+            submitted_order,
+            response,
+            market_state,
+            global_budget,
+            market_budget,
+        )
 
     if has_failed_response:
         refreshed_orders = open_orders_for_token(client, plan.token_id)
@@ -1782,11 +2011,16 @@ def apply_post_response(
     submitted_order: SubmittedOrder,
     response: Any,
     market_state: LiveMarketState,
+    global_budget: RiskBudget,
+    market_budget: RiskBudget,
 ) -> bool:
     if not response_success(response):
         return True
 
     market_state.record_pending_order(submitted_order.proposed_order)
+    if submitted_order.side == BUY:
+        global_budget.reserve_new_collateral(submitted_order.collateral)
+        market_budget.reserve_new_collateral(submitted_order.collateral)
     return False
 
 

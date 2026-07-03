@@ -49,11 +49,17 @@ class Config:
     band_min_size: Decimal | None
     band_avg_size: Decimal | None
     band_max_size: Decimal | None
+    min_price: Decimal
+    max_price: Decimal
+    max_collateral_per_market: Decimal
     max_loss_per_market: Decimal
     max_inventory_per_token: Decimal
     max_inventory_per_market: Decimal
+    max_total_collateral: Decimal
+    min_free_collateral: Decimal
     max_book_spread_ticks: int
     max_pre_post_move_ticks: int
+    max_open_orders_per_token: int
     min_top_depth: Decimal
     quote_sides: QuoteSides
     allow_single_sided: bool
@@ -101,11 +107,17 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
         band_min_size=args.band_min_size,
         band_avg_size=args.band_avg_size,
         band_max_size=args.band_max_size,
+        min_price=args.min_price,
+        max_price=args.max_price,
+        max_collateral_per_market=args.max_collateral_per_market,
         max_loss_per_market=args.max_loss_per_market,
         max_inventory_per_token=args.max_inventory_per_token,
         max_inventory_per_market=args.max_inventory_per_market,
+        max_total_collateral=args.max_total_collateral,
+        min_free_collateral=args.min_free_collateral,
         max_book_spread_ticks=args.max_book_spread_ticks,
         max_pre_post_move_ticks=args.max_pre_post_move_ticks,
+        max_open_orders_per_token=args.max_open_orders_per_token,
         min_top_depth=args.min_top_depth,
         quote_sides=QuoteSides(args.quote_sides),
         allow_single_sided=args.allow_single_sided,
@@ -218,6 +230,21 @@ def build_parser() -> argparse.ArgumentParser:
         default=_env_optional_decimal("MARKET_MAKER_BAND_MAX_SIZE"),
     )
     parser.add_argument(
+        "--min-price",
+        type=_parse_decimal,
+        default=_env_decimal("MARKET_MAKER_MIN_PRICE", Decimal("0.05")),
+    )
+    parser.add_argument(
+        "--max-price",
+        type=_parse_decimal,
+        default=_env_decimal("MARKET_MAKER_MAX_PRICE", Decimal("0.95")),
+    )
+    parser.add_argument(
+        "--max-collateral-per-market",
+        type=_parse_decimal,
+        default=_env_decimal("MARKET_MAKER_MAX_COLLATERAL_PER_MARKET", Decimal("25")),
+    )
+    parser.add_argument(
         "--max-loss-per-market",
         type=_parse_decimal,
         default=_env_decimal("MARKET_MAKER_MAX_LOSS_PER_MARKET", Decimal("25")),
@@ -233,6 +260,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=_env_decimal("MARKET_MAKER_MAX_INVENTORY_PER_MARKET", Decimal("50")),
     )
     parser.add_argument(
+        "--max-total-collateral",
+        type=_parse_decimal,
+        default=_env_decimal("MARKET_MAKER_MAX_TOTAL_COLLATERAL", Decimal("50")),
+    )
+    parser.add_argument(
+        "--min-free-collateral",
+        type=_parse_decimal,
+        default=_env_decimal("MARKET_MAKER_MIN_FREE_COLLATERAL", Decimal("1")),
+    )
+    parser.add_argument(
         "--max-book-spread-ticks",
         type=int,
         default=_env_int("MARKET_MAKER_MAX_BOOK_SPREAD_TICKS", 20),
@@ -241,6 +278,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-pre-post-move-ticks",
         type=int,
         default=_env_int("MARKET_MAKER_MAX_PRE_POST_MOVE_TICKS", 2),
+    )
+    parser.add_argument(
+        "--max-open-orders-per-token",
+        type=int,
+        default=_env_int("MARKET_MAKER_MAX_OPEN_ORDERS_PER_TOKEN", 2),
     )
     parser.add_argument(
         "--min-top-depth",
@@ -381,16 +423,30 @@ def validate_config(config: Config, parser: argparse.ArgumentParser) -> None:
         parser.error("MARKET_MAKER_BAND_*_SIZE must be non-negative with avg and max greater than zero")
     if band_min_size > band_avg_size or band_avg_size > band_max_size:
         parser.error("MARKET_MAKER_BAND_*_SIZE must satisfy min <= avg <= max")
+    if config.min_price <= Decimal("0") or config.min_price >= Decimal("1"):
+        parser.error("MARKET_MAKER_MIN_PRICE must be between 0 and 1")
+    if config.max_price <= Decimal("0") or config.max_price >= Decimal("1"):
+        parser.error("MARKET_MAKER_MAX_PRICE must be between 0 and 1")
+    if config.min_price >= config.max_price:
+        parser.error("MARKET_MAKER_MIN_PRICE must be less than MARKET_MAKER_MAX_PRICE")
+    if config.max_collateral_per_market <= Decimal("0"):
+        parser.error("MARKET_MAKER_MAX_COLLATERAL_PER_MARKET must be greater than zero")
     if config.max_loss_per_market <= Decimal("0"):
         parser.error("MARKET_MAKER_MAX_LOSS_PER_MARKET must be greater than zero")
     if config.max_inventory_per_token <= Decimal("0"):
         parser.error("MARKET_MAKER_MAX_INVENTORY_PER_TOKEN must be greater than zero")
     if config.max_inventory_per_market <= Decimal("0"):
         parser.error("MARKET_MAKER_MAX_INVENTORY_PER_MARKET must be greater than zero")
+    if config.max_total_collateral <= Decimal("0"):
+        parser.error("MARKET_MAKER_MAX_TOTAL_COLLATERAL must be greater than zero")
+    if config.min_free_collateral < Decimal("0"):
+        parser.error("MARKET_MAKER_MIN_FREE_COLLATERAL cannot be negative")
     if config.max_book_spread_ticks <= 0:
         parser.error("MARKET_MAKER_MAX_BOOK_SPREAD_TICKS must be greater than zero")
     if config.max_pre_post_move_ticks <= 0:
         parser.error("MARKET_MAKER_MAX_PRE_POST_MOVE_TICKS must be greater than zero")
+    if config.max_open_orders_per_token <= 0:
+        parser.error("MARKET_MAKER_MAX_OPEN_ORDERS_PER_TOKEN must be greater than zero")
     if config.min_top_depth < Decimal("0"):
         parser.error("MARKET_MAKER_MIN_TOP_DEPTH cannot be negative")
     if config.event_slug is not None and not config.event_slug.strip():
